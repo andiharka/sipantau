@@ -472,10 +472,18 @@ def heartbeat_loop():
                 }
                 
                 url = f"{server_url.rstrip('/')}/api/pantau/heartbeat"
-                requests.post(url, json=payload, headers=headers, timeout=5)
-        except Exception:
-            # Silently catch unreachable server exceptions and retry next iteration
-            pass
+                logging.info(f"Sending heartbeat to {url}...")
+                response = requests.post(url, json=payload, headers=headers, timeout=5)
+                if response.status_code not in (200, 201):
+                    msg = f"Heartbeat failed with status code {response.status_code}: {response.text}"
+                    logging.error(msg)
+                    print(msg)
+                else:
+                    logging.info("Heartbeat successful")
+        except Exception as e:
+            msg = f"Heartbeat exception: {str(e)}"
+            logging.error(msg)
+            print(msg)
         time.sleep(10)
 
 # Main Application Entrypoint
