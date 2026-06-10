@@ -1,6 +1,6 @@
-# Windows 10 School Computer Lab Agent
+# SIPANTAU
 
-This is a Python-based administration agent designed to run on Windows 10 client PCs in a school computer lab. The agent is controlled remotely via an AdonisJS server over HTTP and requires administrative privileges.
+This is a Python-based administration agent designed to run on Windows 10 client PCs in a public computer. The agent is controlled remotely via an AdonisJS server over HTTP and requires administrative privileges.
 
 ## Features
 

@@ -340,6 +340,23 @@ def hide_lock_screen_gui():
         lock_window = None
 
 # 8. API Endpoints
+@app.route("/sync-blacklist", methods=["POST"])
+@require_api_key
+def sync_blacklist():
+    data = request.get_json(force=True, silent=True) or {}
+    blacklisted_apps = data.get("blacklisted_apps")
+    if blacklisted_apps is None or not isinstance(blacklisted_apps, list):
+        return jsonify({"error": "Missing or invalid blacklisted_apps parameter"}), 400
+
+    config["blacklisted_apps"] = blacklisted_apps
+    try:
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
+    except Exception as e:
+        return jsonify({"error": f"Failed to save config to disk: {str(e)}"}), 500
+
+    return jsonify({"status": "synchronized", "blacklisted_apps": blacklisted_apps})
+
 @app.route("/lock", methods=["POST"])
 @require_api_key
 def lock_endpoint():
@@ -454,7 +471,7 @@ def heartbeat_loop():
                     "Content-Type": "application/json"
                 }
                 
-                url = f"{server_url.rstrip('/')}/api/lab/heartbeat"
+                url = f"{server_url.rstrip('/')}/api/pantau/heartbeat"
                 requests.post(url, json=payload, headers=headers, timeout=5)
         except Exception:
             # Silently catch unreachable server exceptions and retry next iteration

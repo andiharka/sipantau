@@ -1,4 +1,4 @@
-name: Build and Release LabAgent
+name: Build and Release SIPANTAU
 
 on:
   push:
@@ -32,7 +32,7 @@ jobs:
 
       - name: Build Executable
         run: |
-          pyinstaller --onefile --noconsole --name LabAgent agent.py
+          pyinstaller --onefile --noconsole --name SIPANTAU agent.py
 
       - name: Prepare default config.json
         shell: bash
@@ -56,7 +56,7 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            dist/LabAgent.exe
+            dist/sipantau.exe
             config.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
