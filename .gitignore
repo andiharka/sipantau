@@ -1,0 +1,20 @@
+# PyInstaller build outputs
+dist/
+build/
+*.spec
+
+# Python cache and bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# Local agent database/logs
+hosts_mock
+agent.log
