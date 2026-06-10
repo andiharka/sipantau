@@ -1,0 +1,11 @@
+{
+  "api_key": "changeme",
+  "server_url": "http://192.168.1.233",
+  "blacklisted_apps": [
+    "steam.exe",
+    "discord.exe"
+  ],
+  "time_limit_hours": 3,
+  "master_password": "secret",
+  "port": 5001
+}
