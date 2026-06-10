@@ -10,6 +10,7 @@ import tkinter as tk
 from functools import wraps
 from flask import Flask, request, jsonify
 import requests
+import urllib3
 import psutil
 
 # 1. Config Loader
@@ -473,7 +474,12 @@ def heartbeat_loop():
                 
                 url = f"{server_url.rstrip('/')}/api/pantau/heartbeat"
                 logging.info(f"Sending heartbeat to {url}...")
-                response = requests.post(url, json=payload, headers=headers, timeout=5)
+                
+                verify_ssl = config.get("verify_ssl", True)
+                if not verify_ssl:
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                
+                response = requests.post(url, json=payload, headers=headers, timeout=5, verify=verify_ssl)
                 if response.status_code not in (200, 201):
                     msg = f"Heartbeat failed with status code {response.status_code}: {response.text}"
                     logging.error(msg)
