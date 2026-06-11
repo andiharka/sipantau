@@ -164,10 +164,9 @@ def get_blocked_sites():
         pass
     return sorted(list(blocked))
 
-# 6. Hosts Blocking Operations
 def block_domain(domain):
     domain = domain.strip().lower()
-    entries = [f"127.0.0.1 {domain}", f"127.0.0.1 www.{domain}"]
+    domains_to_block = [domain, f"www.{domain}"]
     
     try:
         with open(hosts_path, 'r') as f:
@@ -178,15 +177,17 @@ def block_domain(domain):
     lines = content.splitlines()
     updated = False
     
-    for entry in entries:
+    for dom in domains_to_block:
         exists = False
         for line in lines:
             line_stripped = line.strip().lower()
-            if not line_stripped.startswith("#") and entry in line_stripped:
-                exists = True
-                break
+            if not line_stripped.startswith("#"):
+                parts = line_stripped.split()
+                if len(parts) >= 2 and parts[0] == "127.0.0.1" and parts[1] == dom:
+                    exists = True
+                    break
         if not exists:
-            lines.append(f"{entry} # agent-blocked")
+            lines.append(f"127.0.0.1 {dom} # agent-blocked")
             updated = True
             
     if updated:
