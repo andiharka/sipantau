@@ -8,5 +8,8 @@
   "time_limit_hours": 3,
   "master_password": "secret",
   "port": 5001,
-  "verify_ssl": false
+  "verify_ssl": false,
+  "autorun": false,
+  "auto_lock_on_run": false,
+  "hostname": ""
 }

@@ -88,6 +88,42 @@ def require_api_key(f):
     return decorated
 
 # 5. Helpers for System Status
+def get_agent_hostname():
+    custom_name = config.get("hostname")
+    if custom_name:
+        return custom_name.strip()
+    return socket.gethostname()
+
+def update_autorun(enabled):
+    if os.name != 'nt':
+        return
+    try:
+        import winreg
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        app_name = "SipantauAgent"
+        
+        # Determine executable path
+        if getattr(sys, 'frozen', False):
+            # Running as compiled exe
+            exe_path = sys.executable
+        else:
+            # Running as script
+            exe_path = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+            
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
+        if enabled:
+            winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, exe_path)
+            logging.info(f"Autorun registry entry added: {exe_path}")
+        else:
+            try:
+                winreg.DeleteValue(key, app_name)
+                logging.info("Autorun registry entry removed.")
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+    except Exception as e:
+        logging.error(f"Failed to update autorun registry: {str(e)}")
+
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -399,7 +435,7 @@ def status_endpoint():
         locked_state = is_locked
         
     status_data = {
-        "hostname": socket.gethostname(),
+        "hostname": get_agent_hostname(),
         "ip": get_local_ip(),
         "running_apps": get_running_apps(),
         "blocked_sites": get_blocked_sites(),
@@ -459,7 +495,7 @@ def heartbeat_loop():
                     locked_state = is_locked
                 
                 payload = {
-                    "hostname": socket.gethostname(),
+                    "hostname": get_agent_hostname(),
                     "ip": get_local_ip(),
                     "is_locked": locked_state,
                     "running_apps": get_running_apps(),
@@ -497,6 +533,13 @@ if __name__ == "__main__":
     # Initialize Tkinter system first on the main thread
     root = tk.Tk()
     root.withdraw() # Hide root controller window
+
+    # Configure autorun registration (Windows only)
+    update_autorun(config.get("autorun", False))
+
+    # Auto-lock the PC on run if configured
+    if config.get("auto_lock_on_run", False):
+        root.after(0, show_lock_screen_gui)
 
     # Run Flask API server in a background daemon thread
     flask_thread = threading.Thread(
