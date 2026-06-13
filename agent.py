@@ -730,7 +730,6 @@ def heartbeat_loop():
                 }
                 
                 url = f"{server_url.rstrip('/')}/api/pantau/heartbeat"
-                logging.info(f"Sending heartbeat to {url}...")
                 
                 verify_ssl = config.get("verify_ssl", True)
                 if not verify_ssl:
@@ -741,8 +740,6 @@ def heartbeat_loop():
                     msg = f"Heartbeat failed with status code {response.status_code}: {response.text}"
                     logging.error(msg)
                     print(msg)
-                else:
-                    logging.info("Heartbeat successful")
         except Exception as e:
             msg = f"Heartbeat exception: {str(e)}"
             logging.error(msg)
