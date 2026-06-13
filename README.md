@@ -21,7 +21,7 @@ Place `config.json` in the same directory as `agent.py` (or the compiled `.exe`)
   "api_key": "changeme",
   "server_url": "http://192.168.1.1:3333",
   "blacklisted_apps": ["steam.exe", "discord.exe"],
-  "time_limit_hours": 3,
+  "time_limit_seconds": 10800,
   "master_password": "secret",
   "port": 5001,
   "verify_ssl": false,
