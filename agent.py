@@ -7,6 +7,7 @@ import threading
 import logging
 import subprocess
 import tkinter as tk
+from tkinter import messagebox
 from functools import wraps
 from flask import Flask, request, jsonify
 import requests
@@ -81,6 +82,7 @@ gui_lock = threading.Lock()
 session_remaining_seconds = 0
 session_active = False
 session_lock = threading.Lock()
+timer_window = None
 
 # 4. Authentication Decorator
 def require_api_key(f):
@@ -386,6 +388,156 @@ def hide_lock_screen_gui():
         lock_window.destroy()
         lock_window = None
 
+# --- Drag and drop support for floating window ---
+def start_drag(event):
+    win = event.widget.winfo_toplevel()
+    win._drag_x = event.x
+    win._drag_y = event.y
+
+def drag_motion(event):
+    win = event.widget.winfo_toplevel()
+    dx = event.x - win._drag_x
+    dy = event.y - win._drag_y
+    x = win.winfo_x() + dx
+    y = win.winfo_y() + dy
+    win.geometry(f"+{x}+{y}")
+
+# --- Stop session action ---
+def stop_session_action():
+    if messagebox.askyesno("Hentikan Sesi", "Apakah Anda yakin ingin menghentikan sesi sekarang?\nKomputer Anda akan langsung dikunci."):
+        global session_active, session_remaining_seconds
+        with session_lock:
+            session_active = False
+            session_remaining_seconds = 0
+        show_lock_screen_gui()
+
+# --- Floating countdown timer widget ---
+def show_timer_window_gui():
+    global timer_window
+    if timer_window is not None:
+        return
+        
+    timer_window = tk.Toplevel(root)
+    timer_window.configure(bg="#222222")
+    timer_window.overrideredirect(True)  # borderless
+    timer_window.attributes("-topmost", True)
+    
+    # Drag-and-drop bindings
+    timer_window.bind("<Button-1>", start_drag)
+    timer_window.bind("<B1-Motion>", drag_motion)
+    
+    # Internal variables to track dragging
+    timer_window._drag_x = 0
+    timer_window._drag_y = 0
+    
+    # Position widget in the top-right corner of the screen
+    screen_width = timer_window.winfo_screenwidth()
+    width = 240
+    height = 90
+    x = screen_width - width - 40
+    y = 40
+    timer_window.geometry(f"{width}x{height}+{x}+{y}")
+    
+    # Main container frame
+    container = tk.Frame(timer_window, bg="#222222", bd=1, relief="solid", highlightbackground="#3b82f6", highlightcolor="#3b82f6", highlightthickness=1)
+    container.pack(fill="both", expand=True)
+    container.bind("<Button-1>", start_drag)
+    container.bind("<B1-Motion>", drag_motion)
+    timer_window.container_frame = container
+    
+    # Text label for countdown
+    time_label = tk.Label(container, text="", font=("Helvetica", 14, "bold"), fg="#3b82f6", bg="#222222")
+    time_label.pack(pady=(10, 2))
+    time_label.bind("<Button-1>", start_drag)
+    time_label.bind("<B1-Motion>", drag_motion)
+    timer_window.time_label = time_label
+    
+    # Warning description label
+    desc_label = tk.Label(container, text="", font=("Helvetica", 8), fg="#ef4444", bg="#222222", wraplength=220)
+    desc_label.pack(pady=0)
+    desc_label.bind("<Button-1>", start_drag)
+    desc_label.bind("<B1-Motion>", drag_motion)
+    timer_window.desc_label = desc_label
+    
+    # Stop Session Button
+    stop_btn = tk.Button(
+        container,
+        text="Hentikan Sesi",
+        font=("Helvetica", 9, "bold"),
+        bg="#dc2626",
+        fg="white",
+        activebackground="#b91c1c",
+        activeforeground="white",
+        relief="flat",
+        bd=0,
+        command=stop_session_action
+    )
+    stop_btn.pack(pady=(2, 10))
+    timer_window.stop_btn = stop_btn
+
+def update_timer_gui():
+    global timer_window, session_active, session_remaining_seconds, is_locked
+    
+    with session_lock:
+        active = session_active
+        remaining = session_remaining_seconds
+        
+    with gui_lock:
+        locked = is_locked
+        
+    if active and not locked:
+        if timer_window is None:
+            show_timer_window_gui()
+            
+        if timer_window:
+            if remaining >= 600:
+                hrs = remaining // 3600
+                mins = (remaining % 3600) // 60
+                if hrs > 0:
+                    time_str = f"Sisa: {hrs} jam {mins} menit"
+                else:
+                    time_str = f"Sisa: {mins} menit"
+                
+                timer_window.container_frame.config(bg="#222222", highlightbackground="#3b82f6")
+                timer_window.time_label.config(text=time_str, fg="#3b82f6", bg="#222222")
+                timer_window.desc_label.config(text="", bg="#222222")
+                timer_window.geometry("240x90")
+                timer_window.attributes("-topmost", True)
+            
+            elif remaining >= 180:
+                mins = remaining // 60
+                secs = remaining % 60
+                time_str = f"Sisa: {mins:02d}:{secs:02d}"
+                
+                timer_window.container_frame.config(bg="#222222", highlightbackground="#f97316")
+                timer_window.time_label.config(text=time_str, fg="#f97316", bg="#222222")
+                timer_window.desc_label.config(text="", bg="#222222")
+                timer_window.geometry("240x90")
+                timer_window.attributes("-topmost", True)
+                
+            else:
+                mins = remaining // 60
+                secs = remaining % 60
+                time_str = f"Sisa: {mins:02d}:{secs:02d}"
+                alert_text = "PERINGATAN: Sesi hampir habis!\nSegera simpan pekerjaan Anda!"
+                
+                timer_window.container_frame.config(bg="#450a0a", highlightbackground="#ef4444")
+                timer_window.time_label.config(text=time_str, fg="#fca5a5", bg="#450a0a")
+                timer_window.desc_label.config(text=alert_text, fg="#ffffff", bg="#450a0a")
+                timer_window.geometry("240x120")
+                timer_window.attributes("-topmost", True)
+                
+    else:
+        if timer_window is not None:
+            try:
+                timer_window.destroy()
+            except Exception:
+                pass
+            timer_window = None
+            
+    if root:
+        root.after(1000, update_timer_gui)
+
 # 8. API Endpoints
 @app.route("/sync-blacklist", methods=["POST"])
 @require_api_key
@@ -646,6 +798,9 @@ if __name__ == "__main__":
     # Run the local session timer loop
     timer_thread = threading.Thread(target=session_timer_loop, daemon=True)
     timer_thread.start()
+
+    # Start periodic GUI timer updates
+    root.after(1000, update_timer_gui)
 
     # Enter blocking Tkinter GUI loop on the main thread
     try:
