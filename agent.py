@@ -77,6 +77,11 @@ lock_window = None
 is_locked = False
 gui_lock = threading.Lock()
 
+# Local Session Control State
+session_remaining_seconds = 0
+session_active = False
+session_lock = threading.Lock()
+
 # 4. Authentication Decorator
 def require_api_key(f):
     @wraps(f)
@@ -335,6 +340,10 @@ def show_lock_screen_gui():
     def handle_pwd_unlock(event=None):
         entered = pwd_entry.get()
         if entered == config.get("master_password"):
+            global session_remaining_seconds, session_active
+            with session_lock:
+                session_active = False
+                session_remaining_seconds = 0
             hide_lock_screen_gui()
         else:
             pwd_entry.delete(0, tk.END)
@@ -398,14 +407,63 @@ def sync_blacklist():
 @app.route("/lock", methods=["POST"])
 @require_api_key
 def lock_endpoint():
+    global session_remaining_seconds, session_active
+    with session_lock:
+        session_active = False
+        session_remaining_seconds = 0
     root.after(0, show_lock_screen_gui)
     return jsonify({"status": "locked"})
 
 @app.route("/unlock", methods=["POST"])
 @require_api_key
 def unlock_endpoint():
+    global session_remaining_seconds, session_active
+    data = request.get_json(force=True, silent=True) or {}
+    time_limit = data.get("time_limit_seconds")
+    
+    with session_lock:
+        if time_limit is not None:
+            try:
+                session_remaining_seconds = int(time_limit)
+                session_active = True
+                logging.info(f"Session unlocked with local timer set to {session_remaining_seconds} seconds")
+            except ValueError:
+                logging.error(f"Invalid time_limit_seconds received: {time_limit}")
+        else:
+            session_remaining_seconds = 0
+            session_active = False
+            logging.info("Session unlocked without local timer (untimed)")
+
     root.after(0, hide_lock_screen_gui)
-    return jsonify({"status": "unlocked"})
+    return jsonify({
+        "status": "unlocked",
+        "session_active": session_active,
+        "session_remaining_seconds": session_remaining_seconds
+    })
+
+@app.route("/update-session-time", methods=["POST"])
+@require_api_key
+def update_session_time():
+    global session_remaining_seconds, session_active
+    data = request.get_json(force=True, silent=True) or {}
+    time_limit = data.get("remaining_seconds")
+    
+    if time_limit is None:
+        return jsonify({"error": "Missing remaining_seconds parameter"}), 400
+        
+    with session_lock:
+        try:
+            session_remaining_seconds = int(time_limit)
+            session_active = True
+            logging.info(f"Session timer updated to {session_remaining_seconds} seconds")
+        except ValueError:
+            return jsonify({"error": "Invalid remaining_seconds parameter"}), 400
+            
+    return jsonify({
+        "status": "updated",
+        "session_active": session_active,
+        "session_remaining_seconds": session_remaining_seconds
+    })
 
 @app.route("/block-site", methods=["POST"])
 @require_api_key
@@ -434,13 +492,18 @@ def unblock_site():
 def status_endpoint():
     with gui_lock:
         locked_state = is_locked
+    with session_lock:
+        rem_seconds = session_remaining_seconds
+        active_state = session_active
         
     status_data = {
         "hostname": get_agent_hostname(),
         "ip": get_local_ip(),
         "running_apps": get_running_apps(),
         "blocked_sites": get_blocked_sites(),
-        "is_locked": locked_state
+        "is_locked": locked_state,
+        "session_remaining_seconds": rem_seconds,
+        "session_active": active_state
     }
     return jsonify(status_data)
 
@@ -494,13 +557,18 @@ def heartbeat_loop():
             if server_url:
                 with gui_lock:
                     locked_state = is_locked
+                with session_lock:
+                    rem_seconds = session_remaining_seconds
+                    active_state = session_active
                 
                 payload = {
                     "hostname": get_agent_hostname(),
                     "ip": get_local_ip(),
                     "is_locked": locked_state,
                     "running_apps": get_running_apps(),
-                    "blacklisted_apps": config.get("blacklisted_apps", [])
+                    "blacklisted_apps": config.get("blacklisted_apps", []),
+                    "session_remaining_seconds": rem_seconds,
+                    "session_active": active_state
                 }
                 
                 api_key = config.get("api_key", "")
@@ -529,6 +597,24 @@ def heartbeat_loop():
             print(msg)
         time.sleep(10)
 
+# 11. Local Session Countdown Timer Thread
+def session_timer_loop():
+    global session_remaining_seconds, session_active
+    while True:
+        try:
+            with session_lock:
+                if session_active:
+                    if session_remaining_seconds > 0:
+                        session_remaining_seconds -= 1
+                    else:
+                        session_active = False
+                        logging.info("Local session countdown reached 0. Triggering self-lock.")
+                        if root:
+                            root.after(0, show_lock_screen_gui)
+        except Exception as e:
+            logging.error(f"Error in session timer loop: {str(e)}")
+        time.sleep(1)
+
 # Main Application Entrypoint
 if __name__ == "__main__":
     # Initialize Tkinter system first on the main thread
@@ -556,6 +642,10 @@ if __name__ == "__main__":
     # Run the client status heartbeat loop
     heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
     heartbeat_thread.start()
+
+    # Run the local session timer loop
+    timer_thread = threading.Thread(target=session_timer_loop, daemon=True)
+    timer_thread.start()
 
     # Enter blocking Tkinter GUI loop on the main thread
     try:
