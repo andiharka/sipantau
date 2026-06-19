@@ -77,6 +77,8 @@ root = None
 lock_window = None
 is_locked = False
 gui_lock = threading.Lock()
+active_notifications = []
+notification_lock = threading.Lock()
 
 # Local Session Control State
 session_remaining_seconds = 0
@@ -298,7 +300,7 @@ def show_lock_screen_gui():
 
     label = tk.Label(
         frame, 
-        text="Session time limit reached. Please ask the staff to continue.",
+        text="Komputer Terkunci. Silahkan hubungi petugas untuk menggunakan komputer.",
         font=("Helvetica", 24, "bold"),
         fg="white",
         bg="black",
@@ -311,7 +313,7 @@ def show_lock_screen_gui():
 
     pwd_label = tk.Label(
         pwd_frame,
-        text="Enter password to unlock:",
+        text="Masukkan Master Password :",
         font=("Helvetica", 14),
         fg="#aaaaaa",
         bg="black"
@@ -349,14 +351,14 @@ def show_lock_screen_gui():
             hide_lock_screen_gui()
         else:
             pwd_entry.delete(0, tk.END)
-            error_label.config(text="Incorrect master password.")
+            error_label.config(text="Master Password Salah.")
             lock_window.after(3000, lambda: error_label.config(text=""))
 
     pwd_entry.bind("<Return>", handle_pwd_unlock)
 
     btn = tk.Button(
         pwd_frame,
-        text="Unlock",
+        text="Buka Kunci",
         font=("Helvetica", 12, "bold"),
         bg="#444444",
         fg="white",
@@ -387,6 +389,135 @@ def hide_lock_screen_gui():
         lock_window.grab_release()
         lock_window.destroy()
         lock_window = None
+
+def rearrange_notifications():
+    with notification_lock:
+        for index, noti in enumerate(active_notifications):
+            width = 320
+            height = 90
+            try:
+                screen_width = noti.winfo_screenwidth()
+                screen_height = noti.winfo_screenheight()
+                margin_x = 24
+                margin_y = 60
+                y_offset = index * (height + 12)
+                x = screen_width - width - margin_x
+                y = screen_height - height - margin_y - y_offset
+                noti.geometry(f"{width}x{height}+{x}+{y}")
+            except Exception:
+                pass
+
+def trigger_kill_notification(exe_name):
+    # Create borderless, topmost window
+    noti = tk.Toplevel(root)
+    noti.overrideredirect(True)
+    noti.attributes("-topmost", True)
+    
+    try:
+        noti.attributes("-alpha", 0.0)
+    except Exception:
+        pass
+        
+    noti.configure(bg="#1e1e2e")
+    
+    width = 320
+    height = 90
+    
+    screen_width = noti.winfo_screenwidth()
+    screen_height = noti.winfo_screenheight()
+    margin_x = 24
+    margin_y = 60
+    
+    with notification_lock:
+        active_notifications.append(noti)
+        index = len(active_notifications) - 1
+        
+    y_offset = index * (height + 12)
+    x = screen_width - width - margin_x
+    y = screen_height - height - margin_y - y_offset
+    
+    noti.geometry(f"{width}x{height}+{x}+{y}")
+    
+    # Red accent bar on the left
+    accent_bar = tk.Frame(noti, bg="#ef4444", width=5)
+    accent_bar.pack(side="left", fill="y")
+    
+    # Message container
+    container = tk.Frame(noti, bg="#1e1e2e", padx=15, pady=10)
+    container.pack(side="left", fill="both", expand=True)
+    
+    header_label = tk.Label(
+        container,
+        text="⚠️ Aplikasi Dihentikan",
+        font=("Helvetica", 14, "bold"),
+        fg="#ef4444",
+        bg="#1e1e2e",
+        anchor="w"
+    )
+    header_label.pack(fill="x", anchor="w")
+    
+    message = f"'{exe_name}' diblokir oleh administrator."
+    msg_label = tk.Label(
+        container,
+        text=message,
+        font=("Helvetica", 10),
+        fg="#dddddd",
+        bg="#1e1e2e",
+        anchor="w",
+        wraplength=270,
+        justify="left"
+    )
+    msg_label.pack(fill="x", anchor="w", pady=(4, 0))
+    
+    # Close button
+    close_btn = tk.Label(
+        noti,
+        text="×",
+        font=("Helvetica", 14),
+        fg="#a6adc8",
+        bg="#1e1e2e",
+        cursor="hand2"
+    )
+    close_btn.place(x=width - 25, y=5)
+    
+    close_btn.bind("<Enter>", lambda e: close_btn.config(fg="#ef4444"))
+    close_btn.bind("<Leave>", lambda e: close_btn.config(fg="#a6adc8"))
+    
+    # Fade in animation
+    def fade_in(alpha=0.0):
+        if alpha < 0.95:
+            alpha += 0.1
+            try:
+                noti.attributes("-alpha", alpha)
+            except Exception:
+                pass
+            noti.after(20, lambda: fade_in(alpha))
+            
+    fade_in(0.0)
+    
+    # Fade out and destroy
+    def close_noti():
+        def fade_out(alpha=0.95):
+            if alpha > 0.05:
+                alpha -= 0.1
+                try:
+                    noti.attributes("-alpha", alpha)
+                except Exception:
+                    pass
+                noti.after(20, lambda: fade_out(alpha))
+            else:
+                try:
+                    noti.destroy()
+                except Exception:
+                    pass
+                with notification_lock:
+                    if noti in active_notifications:
+                        active_notifications.remove(noti)
+                rearrange_notifications()
+        fade_out(0.95)
+        
+    close_btn.bind("<Button-1>", lambda e: close_noti())
+    noti.after(5000, close_noti)
 
 # --- Drag and drop support for floating window ---
 def start_drag(event):
@@ -667,16 +798,23 @@ def kill_app():
     if not exe:
         return jsonify({"error": "Missing exe parameter"}), 400
         
+    killed = False
     if os.name == 'nt':
-        subprocess.run(["taskkill", "/IM", exe, "/F"], shell=True, capture_output=True)
+        res = subprocess.run(["taskkill", "/IM", exe, "/F"], shell=True, capture_output=True)
+        if res.returncode == 0:
+            killed = True
     else:
         # Fallback to kill local mock processes via psutil on non-Windows
         for proc in psutil.process_iter(['name']):
             try:
                 if proc.info['name'] and proc.info['name'].lower() == exe.lower():
                     proc.kill()
+                    killed = True
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
+
+    if killed and root:
+        root.after(0, lambda: trigger_kill_notification(exe))
 
     return jsonify({"status": "killed", "exe": exe})
 
@@ -694,6 +832,8 @@ def blacklist_watcher():
                             msg = f"Killed blacklisted app: {name}"
                             logging.info(msg)
                             print(msg)
+                            if root:
+                                root.after(0, lambda n=name: trigger_kill_notification(n))
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
         except Exception as e:
