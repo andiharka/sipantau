@@ -40,11 +40,12 @@ jobs:
           cat << 'EOF' > config.json
           {
             "api_key": "changeme",
-            "server_url": "http://192.168.1.1:3333",
-            "blacklisted_apps": [],
-            "time_limit_hours": 3,
+            "server_url": "http://[IP_ADDRESS]",
             "master_password": "secret",
-            "port": 5001
+            "verify_ssl": false,
+            "autorun": false,
+            "auto_lock_on_run": false,
+            "hostname": "PC-00"
           }
           EOF
 

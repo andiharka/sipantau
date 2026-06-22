@@ -1,0 +1,10 @@
+{
+  "is_locked": 0,
+  "from_when": "2026-06-22T06:05:47.000+00:00",
+  "duration": 3600,
+  "blacklisted_apps": [
+    "steam.exe"
+  ],
+  "blocked_sites": [],
+  "pending_actions": []
+}

@@ -8,8 +8,7 @@ import logging
 import subprocess
 import tkinter as tk
 from tkinter import messagebox
-from functools import wraps
-from flask import Flask, request, jsonify
+from datetime import datetime, timezone
 import requests
 import urllib3
 import psutil
@@ -32,14 +31,13 @@ def load_config():
         # Default fallback config if file missing
         fallback = {
             "api_key": "changeme",
-            "server_url": "http://192.168.1.1:3333",
-            "blacklisted_apps": ["steam.exe", "discord.exe"],
-            "time_limit_seconds": 10800,
-            "master_password": "secret"
+            "server_url": "http://localhost:3333",
+            "master_password": "secret",
         }
         return fallback, config_path
 
 config, config_path = load_config()
+state_path = os.path.join(os.path.dirname(config_path), "state.json")
 
 # 2. Setup Logging
 log_path = os.path.join(os.path.dirname(config_path), "agent.log")
@@ -69,9 +67,6 @@ if os.name == 'nt':
 else:
     keyboard = None
 
-# Flask App Initialisation
-app = Flask(__name__)
-
 # GUI Global Control State
 root = None
 lock_window = None
@@ -79,22 +74,46 @@ is_locked = False
 gui_lock = threading.Lock()
 active_notifications = []
 notification_lock = threading.Lock()
-
-# Local Session Control State
-session_remaining_seconds = 0
-session_active = False
-session_lock = threading.Lock()
 timer_window = None
 
-# 4. Authentication Decorator
-def require_api_key(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        api_key = request.headers.get("X-API-Key")
-        if not api_key or api_key != config.get("api_key"):
-            return jsonify({"error": "Unauthorized"}), 401
-        return f(*args, **kwargs)
-    return decorated
+# Local Persistent State Management
+STATE_LOCK = threading.Lock()
+local_state = {
+    "is_locked": True,
+    "from_when": None,
+    "duration": None,
+    "blacklisted_apps": [],
+    "blocked_sites": [],
+    "pending_actions": []
+}
+
+def load_state():
+    global local_state
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, "r") as f:
+                loaded = json.load(f)
+                with STATE_LOCK:
+                    local_state.update(loaded)
+            logging.info("State successfully loaded from file.")
+        except Exception as e:
+            logging.error(f"Error loading state from file: {e}")
+    else:
+        save_state()
+
+def save_state():
+    try:
+        with STATE_LOCK:
+            state_copy = dict(local_state)
+        temp_path = state_path + ".tmp"
+        with open(temp_path, "w") as f:
+            json.dump(state_copy, f, indent=2)
+        os.replace(temp_path, state_path)
+    except Exception as e:
+        logging.error(f"Error saving state to file: {e}")
+
+# Event to trigger heartbeat wakeups immediately upon manual action
+heartbeat_event = threading.Event()
 
 # 5. Helpers for System Status
 def get_agent_hostname():
@@ -246,6 +265,20 @@ def unblock_domain(domain):
             
     return removed
 
+def sync_hosts_file(blocked_sites):
+    current_blocked = get_blocked_sites()
+    to_block = [d.strip().lower() for d in blocked_sites if d.strip()]
+    
+    for domain in to_block:
+        if domain not in current_blocked:
+            block_domain(domain)
+            logging.info(f"Blocked domain: {domain}")
+            
+    for domain in current_blocked:
+        if domain not in to_block:
+            unblock_domain(domain)
+            logging.info(f"Unblocked domain: {domain}")
+
 # 7. GUI Kiosk Screen Operations (Must be executed on main Tkinter thread)
 def show_lock_screen_gui():
     global lock_window, is_locked
@@ -344,11 +377,17 @@ def show_lock_screen_gui():
     def handle_pwd_unlock(event=None):
         entered = pwd_entry.get()
         if entered == config.get("master_password"):
-            global session_remaining_seconds, session_active
-            with session_lock:
-                session_active = False
-                session_remaining_seconds = 0
+            global local_state
+            with STATE_LOCK:
+                local_state["is_locked"] = False
+                local_state["from_when"] = None
+                local_state["duration"] = None
+                if "force-unlock" not in local_state["pending_actions"]:
+                    local_state["pending_actions"].append("force-unlock")
+            save_state()
+            
             hide_lock_screen_gui()
+            heartbeat_event.set()
         else:
             pwd_entry.delete(0, tk.END)
             error_label.config(text="Master Password Salah.")
@@ -536,11 +575,17 @@ def drag_motion(event):
 # --- Stop session action ---
 def stop_session_action():
     if messagebox.askyesno("Hentikan Sesi", "Apakah Anda yakin ingin menghentikan sesi sekarang?\nKomputer Anda akan langsung dikunci."):
-        global session_active, session_remaining_seconds
-        with session_lock:
-            session_active = False
-            session_remaining_seconds = 0
+        global local_state
+        with STATE_LOCK:
+            local_state["is_locked"] = True
+            local_state["from_when"] = None
+            local_state["duration"] = None
+            if "force-lock" not in local_state["pending_actions"]:
+                local_state["pending_actions"].append("force-lock")
+        save_state()
+        
         show_lock_screen_gui()
+        heartbeat_event.set()
 
 # --- Floating countdown timer widget ---
 def show_timer_window_gui():
@@ -606,58 +651,194 @@ def show_timer_window_gui():
     stop_btn.pack(pady=(2, 10))
     timer_window.stop_btn = stop_btn
 
-def update_timer_gui():
-    global timer_window, session_active, session_remaining_seconds, is_locked
+    # Hover detection to support distraction-free mode
+    timer_window.mouse_inside = False
+
+    def on_enter(event):
+        timer_window.mouse_inside = True
+        update_timer_layout()
+
+    def on_leave(event):
+        try:
+            x, y = timer_window.winfo_pointerxy()
+            wx = timer_window.winfo_rootx()
+            wy = timer_window.winfo_rooty()
+            ww = timer_window.winfo_width()
+            wh = timer_window.winfo_height()
+            if not (wx <= x < wx + ww and wy <= y < wy + wh):
+                timer_window.mouse_inside = False
+                update_timer_layout()
+        except Exception:
+            pass
+
+    # Bind hover listeners to the window and container elements
+    for widget in (timer_window, container, time_label, desc_label, stop_btn):
+        widget.bind("<Enter>", on_enter, add="+")
+        widget.bind("<Leave>", on_leave, add="+")
+
+def update_timer_layout():
+    global timer_window
+    if not timer_window:
+        return
+        
+    with STATE_LOCK:
+        is_locked_local = local_state["is_locked"]
+        from_when_local = local_state["from_when"]
+        duration_local = local_state["duration"]
+        
+    remaining = 0
+    if not is_locked_local and from_when_local and duration_local:
+        try:
+            cleaned_time = from_when_local.replace("Z", "+00:00")
+            started_at = datetime.fromisoformat(cleaned_time)
+            now_utc = datetime.now(timezone.utc)
+            elapsed = (now_utc - started_at).total_seconds()
+            remaining = int(duration_local - elapsed)
+        except Exception:
+            pass
+            
+    if remaining <= 0:
+        if timer_window is not None:
+            try:
+                timer_window.destroy()
+            except Exception:
+                pass
+            timer_window = None
+        return
+
+    mouse_inside = getattr(timer_window, "mouse_inside", False)
     
-    with session_lock:
-        active = session_active
-        remaining = session_remaining_seconds
-        
-    with gui_lock:
-        locked = is_locked
-        
-    if active and not locked:
-        if timer_window is None:
-            show_timer_window_gui()
+    if remaining >= 600:
+        # Distraction-free mode when remaining time is >= 10 mins
+        hrs = remaining // 3600
+        mins = (remaining % 3600) // 60
+        if hrs > 0:
+            time_str = f"Sisa: {hrs} jam {mins} menit"
+        else:
+            time_str = f"Sisa: {mins} menit"
             
-        if timer_window:
-            if remaining >= 600:
-                hrs = remaining // 3600
-                mins = (remaining % 3600) // 60
-                if hrs > 0:
-                    time_str = f"Sisa: {hrs} jam {mins} menit"
-                else:
-                    time_str = f"Sisa: {mins} menit"
-                
-                timer_window.container_frame.config(bg="#222222", highlightbackground="#3b82f6")
-                timer_window.time_label.config(text=time_str, fg="#3b82f6", bg="#222222")
-                timer_window.desc_label.config(text="", bg="#222222")
-                timer_window.geometry("240x90")
-                timer_window.attributes("-topmost", True)
+        if mouse_inside:
+            # Expanded state on hover
+            timer_window.container_frame.config(bg="#222222", highlightbackground="#3b82f6")
+            timer_window.time_label.config(text=time_str, fg="#3b82f6", bg="#222222")
+            timer_window.desc_label.config(text="", bg="#222222")
             
-            elif remaining >= 180:
-                mins = remaining // 60
-                secs = remaining % 60
-                time_str = f"Sisa: {mins:02d}:{secs:02d}"
+            # Repack elements to ensure correct layout and spacing
+            timer_window.time_label.pack_forget()
+            timer_window.desc_label.pack_forget()
+            timer_window.stop_btn.pack_forget()
+            
+            timer_window.time_label.pack(pady=(10, 2))
+            timer_window.desc_label.pack(pady=0)
+            timer_window.stop_btn.pack(pady=(2, 10))
+            
+            timer_window.geometry("240x90")
+            try:
+                timer_window.attributes("-alpha", 0.95)
+            except Exception:
+                pass
+        else:
+            # Compact state when idle
+            timer_window.container_frame.config(bg="#222222", highlightbackground="#3b82f6")
+            timer_window.time_label.config(text=time_str, fg="#3b82f6", bg="#222222")
+            timer_window.desc_label.config(text="", bg="#222222")
+            
+            timer_window.time_label.pack_forget()
+            timer_window.desc_label.pack_forget()
+            timer_window.stop_btn.pack_forget()
+            
+            timer_window.time_label.pack(pady=(10, 10)) # centered vertically
+            
+            timer_window.geometry("180x45")
+            try:
+                timer_window.attributes("-alpha", 0.65)
+            except Exception:
+                pass
                 
-                timer_window.container_frame.config(bg="#222222", highlightbackground="#f97316")
-                timer_window.time_label.config(text=time_str, fg="#f97316", bg="#222222")
-                timer_window.desc_label.config(text="", bg="#222222")
-                timer_window.geometry("240x90")
-                timer_window.attributes("-topmost", True)
+        timer_window.attributes("-topmost", True)
+        
+    elif remaining >= 180:
+        # Warning mode (orange border)
+        mins = remaining // 60
+        secs = remaining % 60
+        time_str = f"Sisa: {mins:02d}:{secs:02d}"
+        
+        timer_window.container_frame.config(bg="#222222", highlightbackground="#f97316")
+        timer_window.time_label.config(text=time_str, fg="#f97316", bg="#222222")
+        timer_window.desc_label.config(text="", bg="#222222")
+        
+        timer_window.time_label.pack_forget()
+        timer_window.desc_label.pack_forget()
+        timer_window.stop_btn.pack_forget()
+        
+        timer_window.time_label.pack(pady=(10, 2))
+        timer_window.desc_label.pack(pady=0)
+        timer_window.stop_btn.pack(pady=(2, 10))
+        
+        timer_window.geometry("240x90")
+        try:
+            timer_window.attributes("-alpha", 0.95)
+        except Exception:
+            pass
+        timer_window.attributes("-topmost", True)
+        
+    else:
+        # Critical warning mode (red background)
+        mins = remaining // 60
+        secs = remaining % 60
+        time_str = f"Sisa: {mins:02d}:{secs:02d}"
+        alert_text = "PERINGATAN: Sesi hampir habis!\nSegera simpan pekerjaan Anda!"
+        
+        timer_window.container_frame.config(bg="#450a0a", highlightbackground="#ef4444")
+        timer_window.time_label.config(text=time_str, fg="#fca5a5", bg="#450a0a")
+        timer_window.desc_label.config(text=alert_text, fg="#ffffff", bg="#450a0a")
+        
+        timer_window.time_label.pack_forget()
+        timer_window.desc_label.pack_forget()
+        timer_window.stop_btn.pack_forget()
+        
+        timer_window.time_label.pack(pady=(10, 2))
+        timer_window.desc_label.pack(pady=0)
+        timer_window.stop_btn.pack(pady=(2, 10))
+        
+        timer_window.geometry("240x120")
+        try:
+            timer_window.attributes("-alpha", 1.0)
+        except Exception:
+            pass
+        timer_window.attributes("-topmost", True)
+
+def update_timer_gui():
+    global timer_window
+    
+    with STATE_LOCK:
+        is_locked_local = local_state["is_locked"]
+        from_when_local = local_state["from_when"]
+        duration_local = local_state["duration"]
+        
+    if not is_locked_local and from_when_local and duration_local:
+        try:
+            cleaned_time = from_when_local.replace("Z", "+00:00")
+            started_at = datetime.fromisoformat(cleaned_time)
+            now_utc = datetime.now(timezone.utc)
+            elapsed = (now_utc - started_at).total_seconds()
+            remaining = int(duration_local - elapsed)
+        except Exception:
+            remaining = 0
+            
+        if remaining > 0:
+            if timer_window is None:
+                show_timer_window_gui()
                 
-            else:
-                mins = remaining // 60
-                secs = remaining % 60
-                time_str = f"Sisa: {mins:02d}:{secs:02d}"
-                alert_text = "PERINGATAN: Sesi hampir habis!\nSegera simpan pekerjaan Anda!"
-                
-                timer_window.container_frame.config(bg="#450a0a", highlightbackground="#ef4444")
-                timer_window.time_label.config(text=time_str, fg="#fca5a5", bg="#450a0a")
-                timer_window.desc_label.config(text=alert_text, fg="#ffffff", bg="#450a0a")
-                timer_window.geometry("240x120")
-                timer_window.attributes("-topmost", True)
-                
+            if timer_window:
+                update_timer_layout()
+        else:
+            if timer_window is not None:
+                try:
+                    timer_window.destroy()
+                except Exception:
+                    pass
+                timer_window = None
     else:
         if timer_window is not None:
             try:
@@ -669,160 +850,12 @@ def update_timer_gui():
     if root:
         root.after(1000, update_timer_gui)
 
-# 8. API Endpoints
-@app.route("/sync-blacklist", methods=["POST"])
-@require_api_key
-def sync_blacklist():
-    data = request.get_json(force=True, silent=True) or {}
-    blacklisted_apps = data.get("blacklisted_apps")
-    if blacklisted_apps is None or not isinstance(blacklisted_apps, list):
-        return jsonify({"error": "Missing or invalid blacklisted_apps parameter"}), 400
-
-    config["blacklisted_apps"] = blacklisted_apps
-    try:
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
-    except Exception as e:
-        return jsonify({"error": f"Failed to save config to disk: {str(e)}"}), 500
-
-    return jsonify({"status": "synchronized", "blacklisted_apps": blacklisted_apps})
-
-@app.route("/lock", methods=["POST"])
-@require_api_key
-def lock_endpoint():
-    global session_remaining_seconds, session_active
-    with session_lock:
-        session_active = False
-        session_remaining_seconds = 0
-    root.after(0, show_lock_screen_gui)
-    return jsonify({"status": "locked"})
-
-@app.route("/unlock", methods=["POST"])
-@require_api_key
-def unlock_endpoint():
-    global session_remaining_seconds, session_active
-    data = request.get_json(force=True, silent=True) or {}
-    time_limit = data.get("time_limit_seconds")
-    
-    with session_lock:
-        if time_limit is not None:
-            try:
-                session_remaining_seconds = int(time_limit)
-                session_active = True
-                logging.info(f"Session unlocked with local timer set to {session_remaining_seconds} seconds")
-            except ValueError:
-                logging.error(f"Invalid time_limit_seconds received: {time_limit}")
-        else:
-            session_remaining_seconds = 0
-            session_active = False
-            logging.info("Session unlocked without local timer (untimed)")
-
-    root.after(0, hide_lock_screen_gui)
-    return jsonify({
-        "status": "unlocked",
-        "session_active": session_active,
-        "session_remaining_seconds": session_remaining_seconds
-    })
-
-@app.route("/update-session-time", methods=["POST"])
-@require_api_key
-def update_session_time():
-    global session_remaining_seconds, session_active
-    data = request.get_json(force=True, silent=True) or {}
-    time_limit = data.get("remaining_seconds")
-    
-    if time_limit is None:
-        return jsonify({"error": "Missing remaining_seconds parameter"}), 400
-        
-    with session_lock:
-        try:
-            session_remaining_seconds = int(time_limit)
-            session_active = True
-            logging.info(f"Session timer updated to {session_remaining_seconds} seconds")
-        except ValueError:
-            return jsonify({"error": "Invalid remaining_seconds parameter"}), 400
-            
-    return jsonify({
-        "status": "updated",
-        "session_active": session_active,
-        "session_remaining_seconds": session_remaining_seconds
-    })
-
-@app.route("/block-site", methods=["POST"])
-@require_api_key
-def block_site():
-    data = request.get_json(force=True, silent=True) or {}
-    domain = data.get("domain")
-    if not domain:
-        return jsonify({"error": "Missing domain parameter"}), 400
-    
-    block_domain(domain)
-    return jsonify({"status": "blocked", "domain": domain})
-
-@app.route("/unblock-site", methods=["POST"])
-@require_api_key
-def unblock_site():
-    data = request.get_json(force=True, silent=True) or {}
-    domain = data.get("domain")
-    if not domain:
-        return jsonify({"error": "Missing domain parameter"}), 400
-    
-    unblock_domain(domain)
-    return jsonify({"status": "unblocked", "domain": domain})
-
-@app.route("/status", methods=["GET"])
-@require_api_key
-def status_endpoint():
-    with gui_lock:
-        locked_state = is_locked
-    with session_lock:
-        rem_seconds = session_remaining_seconds
-        active_state = session_active
-        
-    status_data = {
-        "hostname": get_agent_hostname(),
-        "ip": get_local_ip(),
-        "running_apps": get_running_apps(),
-        "blocked_sites": get_blocked_sites(),
-        "is_locked": locked_state,
-        "session_remaining_seconds": rem_seconds,
-        "session_active": active_state
-    }
-    return jsonify(status_data)
-
-@app.route("/kill-app", methods=["POST"])
-@require_api_key
-def kill_app():
-    data = request.get_json(force=True, silent=True) or {}
-    exe = data.get("exe")
-    if not exe:
-        return jsonify({"error": "Missing exe parameter"}), 400
-        
-    killed = False
-    if os.name == 'nt':
-        res = subprocess.run(["taskkill", "/IM", exe, "/F"], shell=True, capture_output=True)
-        if res.returncode == 0:
-            killed = True
-    else:
-        # Fallback to kill local mock processes via psutil on non-Windows
-        for proc in psutil.process_iter(['name']):
-            try:
-                if proc.info['name'] and proc.info['name'].lower() == exe.lower():
-                    proc.kill()
-                    killed = True
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-
-    if killed and root:
-        root.after(0, lambda: trigger_kill_notification(exe))
-
-    return jsonify({"status": "killed", "exe": exe})
-
-# 9. Background Process Blacklist Watcher Thread
+# 8. Background Process Blacklist Watcher Thread
 def blacklist_watcher():
     while True:
         try:
-            blacklisted = [app.lower() for app in config.get("blacklisted_apps", [])]
+            with STATE_LOCK:
+                blacklisted = [app.lower() for app in local_state.get("blacklisted_apps", [])]
             if blacklisted:
                 for proc in psutil.process_iter(['name']):
                     try:
@@ -841,67 +874,181 @@ def blacklist_watcher():
             pass
         time.sleep(15)
 
-# 10. Background Heartbeat Thread
+# 9. Background Heartbeat Thread
 def heartbeat_loop():
+    global local_state
+    server_url = config.get("server_url", "")
+    api_key = config.get("api_key", "")
+    verify_ssl = config.get("verify_ssl", True)
+    
+    if not verify_ssl:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
+    headers = {
+        "X-API-Key": api_key,
+        "Content-Type": "application/json"
+    }
+    
     while True:
         try:
-            server_url = config.get("server_url", "")
-            if server_url:
-                with gui_lock:
-                    locked_state = is_locked
-                with session_lock:
-                    rem_seconds = session_remaining_seconds
-                    active_state = session_active
-                
-                payload = {
+            if not server_url:
+                time.sleep(5)
+                continue
+            
+            # Flush pending actions first
+            with STATE_LOCK:
+                actions = list(local_state.get("pending_actions", []))
+            
+            success_actions = []
+            failed = False
+            for act in actions:
+                url_act = f"{server_url.rstrip('/')}/api/pantau/action/{act}"
+                payload_act = {
                     "hostname": get_agent_hostname(),
-                    "ip": get_local_ip(),
-                    "is_locked": locked_state,
-                    "running_apps": get_running_apps(),
-                    "blacklisted_apps": config.get("blacklisted_apps", []),
-                    "session_remaining_seconds": rem_seconds,
-                    "session_active": active_state
+                    "ip": get_local_ip()
                 }
+                try:
+                    res = requests.post(url_act, json=payload_act, headers=headers, timeout=5, verify=verify_ssl)
+                    if res.status_code in (200, 201):
+                        success_actions.append(act)
+                        logging.info(f"Successfully posted pending action: {act}")
+                    else:
+                        logging.error(f"Failed to post action {act}: status code {res.status_code}")
+                        failed = True
+                        break
+                except Exception as ex:
+                    logging.error(f"Connection error posting action {act}: {ex}")
+                    failed = True
+                    break
+            
+            if success_actions:
+                with STATE_LOCK:
+                    for act in success_actions:
+                        if act in local_state["pending_actions"]:
+                            local_state["pending_actions"].remove(act)
+                save_state()
+            
+            if failed:
+                # Sleep or wait event before retrying pending actions
+                heartbeat_event.wait(5)
+                heartbeat_event.clear()
+                continue
+            
+            # Perform normal heartbeat
+            url_hb = f"{server_url.rstrip('/')}/api/pantau/heartbeat"
+            payload_hb = {
+                "hostname": get_agent_hostname(),
+                "ip": get_local_ip(),
+                "running_apps": get_running_apps()
+            }
+            
+            res = requests.post(url_hb, json=payload_hb, headers=headers, timeout=5, verify=verify_ssl)
+            if res.status_code in (200, 201):
+                data = res.json()
+                is_locked_srv = data.get("is_locked", True)
+                from_when_srv = data.get("from_when")
+                duration_srv = data.get("duration")
                 
-                api_key = config.get("api_key", "")
-                headers = {
-                    "X-API-Key": api_key,
-                    "Content-Type": "application/json"
-                }
+                with STATE_LOCK:
+                    local_state["is_locked"] = is_locked_srv
+                    local_state["from_when"] = from_when_srv
+                    local_state["duration"] = duration_srv
+                save_state()
                 
-                url = f"{server_url.rstrip('/')}/api/pantau/heartbeat"
+                if is_locked_srv:
+                    root.after(0, show_lock_screen_gui)
+                else:
+                    root.after(0, hide_lock_screen_gui)
+            else:
+                logging.error(f"Heartbeat failed with code {res.status_code}: {res.text}")
                 
-                verify_ssl = config.get("verify_ssl", True)
-                if not verify_ssl:
-                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-                
-                response = requests.post(url, json=payload, headers=headers, timeout=5, verify=verify_ssl)
-                if response.status_code not in (200, 201):
-                    msg = f"Heartbeat failed with status code {response.status_code}: {response.text}"
-                    logging.error(msg)
-                    print(msg)
         except Exception as e:
-            msg = f"Heartbeat exception: {str(e)}"
-            logging.error(msg)
-            print(msg)
-        time.sleep(10)
+            logging.error(f"Heartbeat exception: {e}")
+            with STATE_LOCK:
+                offline_locked = local_state["is_locked"]
+            if offline_locked:
+                root.after(0, show_lock_screen_gui)
+            else:
+                root.after(0, hide_lock_screen_gui)
+                
+        # Wait 5 seconds or wait until manual action sets event
+        heartbeat_event.wait(5)
+        heartbeat_event.clear()
+
+# 10. Background Blocklist Sync Thread
+def blocklist_sync_loop():
+    global local_state
+    server_url = config.get("server_url", "")
+    api_key = config.get("api_key", "")
+    verify_ssl = config.get("verify_ssl", True)
+    
+    headers = {
+        "X-API-Key": api_key,
+        "Content-Type": "application/json"
+    }
+    
+    while True:
+        try:
+            if not server_url:
+                time.sleep(10)
+                continue
+            
+            url = f"{server_url.rstrip('/')}/api/pantau/blocklist"
+            res = requests.get(url, headers=headers, timeout=5, verify=verify_ssl)
+            if res.status_code == 200:
+                data = res.json()
+                banned_apps = data.get("blacklisted_apps", [])
+                blocked_sites = data.get("blocked_sites", [])
+                
+                with STATE_LOCK:
+                    local_state["blacklisted_apps"] = banned_apps
+                    local_state["blocked_sites"] = blocked_sites
+                save_state()
+                
+                # Sync sites list to local hosts mapping
+                sync_hosts_file(blocked_sites)
+            else:
+                logging.error(f"Blocklist fetch failed with code {res.status_code}")
+        except Exception as e:
+            logging.error(f"Blocklist sync exception: {e}")
+            
+        time.sleep(180)
 
 # 11. Local Session Countdown Timer Thread
 def session_timer_loop():
-    global session_remaining_seconds, session_active
+    global local_state
     while True:
         try:
-            with session_lock:
-                if session_active:
-                    if session_remaining_seconds > 0:
-                        session_remaining_seconds -= 1
-                    else:
-                        session_active = False
-                        logging.info("Local session countdown reached 0. Triggering self-lock.")
-                        if root:
-                            root.after(0, show_lock_screen_gui)
+            with STATE_LOCK:
+                is_locked_local = local_state["is_locked"]
+                from_when_local = local_state["from_when"]
+                duration_local = local_state["duration"]
+                
+            if not is_locked_local and from_when_local and duration_local:
+                try:
+                    cleaned_time = from_when_local.replace("Z", "+00:00")
+                    started_at = datetime.fromisoformat(cleaned_time)
+                    now_utc = datetime.now(timezone.utc)
+                    elapsed = (now_utc - started_at).total_seconds()
+                    remaining = duration_local - elapsed
+                    
+                    if remaining <= 0:
+                        logging.info("Local session countdown expired. Locking PC.")
+                        with STATE_LOCK:
+                            local_state["is_locked"] = True
+                            local_state["from_when"] = None
+                            local_state["duration"] = None
+                            if "force-lock" not in local_state["pending_actions"]:
+                                local_state["pending_actions"].append("force-lock")
+                        save_state()
+                        
+                        root.after(0, show_lock_screen_gui)
+                        heartbeat_event.set()
+                except Exception as ex:
+                    logging.error(f"Error parsing session start time: {ex}")
         except Exception as e:
-            logging.error(f"Error in session timer loop: {str(e)}")
+            logging.error(f"Error in session timer loop: {e}")
+            
         time.sleep(1)
 
 # Main Application Entrypoint
@@ -910,27 +1057,29 @@ if __name__ == "__main__":
     root = tk.Tk()
     root.withdraw() # Hide root controller window
 
+    # Load persistent state from state.json cache
+    load_state()
+
     # Configure autorun registration (Windows only)
     update_autorun(config.get("autorun", False))
 
-    # Auto-lock the PC on run if configured
-    if config.get("auto_lock_on_run", False):
+    # Auto-lock or restore state on run
+    with STATE_LOCK:
+        start_locked = local_state["is_locked"]
+    if start_locked or config.get("auto_lock_on_run", False):
         root.after(0, show_lock_screen_gui)
-
-    # Run Flask API server in a background daemon thread
-    flask_thread = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=config.get("port", 5000), debug=False, use_reloader=False),
-        daemon=True
-    )
-    flask_thread.start()
 
     # Run the background blacklist process checker
     watcher_thread = threading.Thread(target=blacklist_watcher, daemon=True)
     watcher_thread.start()
 
-    # Run the client status heartbeat loop
+    # Run the client status heartbeat loop (replacing the old push Flask API server)
     heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
     heartbeat_thread.start()
+
+    # Run the background blocklist sync loop
+    blocklist_sync_thread = threading.Thread(target=blocklist_sync_loop, daemon=True)
+    blocklist_sync_thread.start()
 
     # Run the local session timer loop
     timer_thread = threading.Thread(target=session_timer_loop, daemon=True)
