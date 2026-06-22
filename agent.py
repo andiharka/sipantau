@@ -82,7 +82,7 @@ local_state = {
     "is_locked": True,
     "from_when": None,
     "duration": None,
-    "blacklisted_apps": [],
+    "blocked_apps": [],
     "blocked_sites": [],
     "pending_actions": []
 }
@@ -850,19 +850,19 @@ def update_timer_gui():
     if root:
         root.after(1000, update_timer_gui)
 
-# 8. Background Process Blacklist Watcher Thread
+# 8. Background Process Blocked Apps Watcher Thread
 def blacklist_watcher():
     while True:
         try:
             with STATE_LOCK:
-                blacklisted = [app.lower() for app in local_state.get("blacklisted_apps", [])]
-            if blacklisted:
+                blocked = [app.lower() for app in local_state.get("blocked_apps", [])]
+            if blocked:
                 for proc in psutil.process_iter(['name']):
                     try:
                         name = proc.info['name']
-                        if name and name.lower() in blacklisted:
+                        if name and name.lower() in blocked:
                             proc.kill()
-                            msg = f"Killed blacklisted app: {name}"
+                            msg = f"Killed blocked app: {name}"
                             logging.info(msg)
                             print(msg)
                             if root:
@@ -997,11 +997,11 @@ def blocklist_sync_loop():
             res = requests.get(url, headers=headers, timeout=5, verify=verify_ssl)
             if res.status_code == 200:
                 data = res.json()
-                banned_apps = data.get("blacklisted_apps", [])
+                banned_apps = data.get("blocked_apps") or data.get("blacklisted_apps", [])
                 blocked_sites = data.get("blocked_sites", [])
                 
                 with STATE_LOCK:
-                    local_state["blacklisted_apps"] = banned_apps
+                    local_state["blocked_apps"] = banned_apps
                     local_state["blocked_sites"] = blocked_sites
                 save_state()
                 
