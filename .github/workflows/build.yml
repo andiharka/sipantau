@@ -26,23 +26,34 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Embed release version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python -c 'import os,re; tag=os.environ["RELEASE_TAG"]; assert re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag); open("version.py", "w").write("VERSION = " + repr(tag[1:]) + "\n")'
+
+      - name: Test agent protocol and countdown
+        run: python -m unittest discover -s tests -v
+
       - name: Install PyInstaller
         run: |
           pip install pyinstaller
 
       - name: Build Executable
         run: |
-          pyinstaller --onefile --noconsole --name SIPANTAU agent.py
+          pyinstaller --onefile --noconsole --uac-admin --name SIPANTAU agent.py
 
       - name: Prepare default config.json
         shell: bash
         run: |
           cat << 'EOF' > config.json
           {
-            "api_key": "changeme",
+            "api_key": "SET_A_GENERATED_KEY_OF_AT_LEAST_32_CHARACTERS",
             "server_url": "http://[IP_ADDRESS]",
-            "master_password": "secret",
-            "verify_ssl": false,
+            "master_password": "",
+            "verify_ssl": true,
+            "auto_update": false,
             "autorun": false,
             "auto_lock_on_run": false,
             "hostname": "PC-00"
@@ -57,7 +68,7 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            dist/sipantau.exe
+            dist/SIPANTAU.exe
             config.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

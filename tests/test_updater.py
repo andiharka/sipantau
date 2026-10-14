@@ -1,0 +1,92 @@
+import hashlib
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest import mock
+import updater
+
+
+def release(data=b'MZwindows executable', tag='v1.2.0'):
+    return {'tag_name': tag, 'assets': [{'name': 'SIPANTAU.exe', 'size': len(data),
+            'digest': 'sha256:' + hashlib.sha256(data).hexdigest(),
+            'browser_download_url': f'https://github.com/{updater.REPOSITORY}/releases/download/{tag}/SIPANTAU.exe'}]}
+
+
+class UpdaterTests(unittest.TestCase):
+    def test_stable_newer_release_requires_trusted_url_digest_and_size(self):
+        self.assertIsNone(updater.select_asset(release(tag='v1.0.0'), '1.0.0'))
+        self.assertIsNone(updater.select_asset({**release(), 'prerelease': True}, '1.0.0'))
+        self.assertIsNone(updater.select_asset(release(tag='v0.9.0'), '1.0.0'))
+        self.assertEqual(updater.select_asset(release(), '1.0.0')[0], 'v1.2.0')
+        for key, value in [('digest', ''), ('browser_download_url', 'http://evil/agent.exe'),
+                           ('size', updater.MAX_DOWNLOAD+1), ('size', True)]:
+            bad = release(); bad['assets'][0][key] = value
+            with self.assertRaises(ValueError): updater.select_asset(bad, '1.0.0')
+        with self.assertRaises(ValueError): updater.version_tuple('v1.0.1-preview')
+
+    def test_corrupt_truncated_or_non_executable_download_never_replaces_staged_file(self):
+        session = mock.MagicMock()
+        response = session.get.return_value.__enter__.return_value
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)/'update.exe'
+            target.write_bytes(b'previous download')
+            for data in [b'corrupt', b'MZwindows executable extra', b'']:
+                response.iter_content.return_value = [data]
+                with self.assertRaises(ValueError): updater.download_asset(session, release()['assets'][0], target)
+                self.assertEqual(target.read_bytes(), b'previous download')
+                self.assertFalse(target.with_suffix('.part').exists())
+            data = b'not an executable'
+            response.iter_content.return_value = [data]
+            with self.assertRaises(ValueError): updater.download_asset(session, release(data)['assets'][0], target)
+            response.iter_content.return_value = [b'MZwindows executable']
+            updater.download_asset(session, release()['assets'][0], target)
+            self.assertEqual(target.read_bytes(), b'MZwindows executable')
+            self.assertTrue(session.get.call_args.kwargs['verify'])
+
+    def test_off_by_default_and_never_checks_while_session_active(self):
+        install = mock.Mock()
+        update = updater.ReleaseUpdater({}, '.', '1.0.0', mock.Mock(), lambda: True, install)
+        self.assertFalse(update.enabled)
+        with mock.patch.object(updater.requests, 'Session') as network:
+            update.check_once(); network.assert_not_called()
+            update.enabled = True
+            update.can_install = lambda: False
+            update.check_once(); network.assert_not_called()
+        install.assert_not_called()
+
+    def test_rechecks_lock_state_after_download_before_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            callbacks = []
+            locked = [True]
+            install = mock.Mock()
+            update = updater.ReleaseUpdater({}, directory, '1.0.0', callbacks.append, lambda: locked[0], install)
+            update.enabled = True
+            with mock.patch.object(updater.requests, 'Session') as session, mock.patch.object(updater, 'download_asset'):
+                session.return_value.__enter__.return_value.get.return_value.json.return_value = release()
+                update.check_once()
+            self.assertEqual(len(callbacks), 1)
+            locked[0] = False
+            callbacks.pop()()
+            install.assert_not_called()
+            self.assertFalse(update.in_progress)
+
+    def test_readiness_marker_only_written_in_config_directory_when_healthy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory)/('update-health-'+'a'*32+'.ready')
+            with mock.patch.object(sys, 'argv', ['agent.exe', '--update-health', str(marker)]):
+                updater.signal_ready(directory, True, False)
+                self.assertFalse(marker.exists())
+                updater.signal_ready(directory, True, True)
+                self.assertEqual(marker.read_text(), 'ready')
+            with mock.patch.object(sys, 'argv', ['agent.exe', '--update-health', str(Path(directory)/'config.json')]):
+                updater.signal_ready(directory, True, True)
+                self.assertFalse((Path(directory)/'config.json').exists())
+
+    def test_installer_escapes_paths_and_restores_previous_executable_after_failed_readiness(self):
+        script = updater.installer_script("C:/Staff's PC/SIPANTAU.exe", 'staged.exe', 'marker', 123, 'a'*64, 'v1.2.0')
+        self.assertIn("Staff''s PC", script)
+        self.assertIn('Get-FileHash', script)
+        self.assertIn('Wait-Process -Id 123', script)
+        self.assertIn("Save-Outcome 'rolled-back'", script)
+        self.assertIn('Copy-Item -LiteralPath $backup -Destination $target', script)

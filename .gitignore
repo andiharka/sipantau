@@ -18,3 +18,12 @@ env/
 # Local agent database/logs
 hosts_mock
 agent.log
+
+# Rotated logs and auto-update runtime files
+agent.log.*
+SIPANTAU.update.exe
+*.previous.exe
+update-install.ps1
+update-health-*.ready
+update-status.json
+*.part

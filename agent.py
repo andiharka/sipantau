@@ -1,14 +1,22 @@
 import os
 import sys
 import json
+import copy
 import time
+import uuid
 import socket
 import threading
+import queue
+import re
+from control_runtime import SessionClock, utc
 import logging
+from logging.handlers import RotatingFileHandler
+from client_logging import NetworkLog
+from version import VERSION
 import subprocess
 import tkinter as tk
 from tkinter import messagebox
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 import urllib3
 import psutil
@@ -30,9 +38,9 @@ def load_config():
     except Exception as e:
         # Default fallback config if file missing
         fallback = {
-            "api_key": "changeme",
-            "server_url": "http://localhost:3333",
-            "master_password": "secret",
+            "api_key": "",
+            "server_url": "",
+            "master_password": None,
         }
         return fallback, config_path
 
@@ -42,11 +50,16 @@ state_path = os.path.join(os.path.dirname(config_path), "state.json")
 # 2. Setup Logging
 log_path = os.path.join(os.path.dirname(config_path), "agent.log")
 logging.basicConfig(
-    filename=log_path,
+    handlers=[RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=5,
+                                 encoding="utf-8", delay=True)],
     level=logging.INFO,
-    format='%(asctime)s - %(message)s',
+    format='%(asctime)s %(levelname)s [%(threadName)s] - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+
+NETWORK_LOG = NetworkLog()
+LAST_HEARTBEAT = None
+LOCAL_ADOPTION = None
 
 # 3. Dynamic Hosts Path (NT vs Unix development fallback)
 if os.name == 'nt':
@@ -71,17 +84,29 @@ else:
 root = None
 lock_window = None
 is_locked = False
+lock_health_error = None
 gui_lock = threading.Lock()
 active_notifications = []
 notification_lock = threading.Lock()
 timer_window = None
 
 # Local Persistent State Management
-STATE_LOCK = threading.Lock()
+STATE_LOCK = threading.RLock()
+SESSION_CLOCK = SessionClock()
+GUI_COMMANDS = queue.Queue()
+SAVE_LOCK = threading.Lock()
+HOSTS_LOCK = threading.RLock()
 local_state = {
     "is_locked": True,
     "from_when": None,
     "duration": None,
+    "control_version": None,
+    "session_id": None,
+    "expires_at": None,
+    "server_offset_seconds": 0,
+    "applied_control_version": None,
+    "attempted_control_version": None,
+    "control_error": None,
     "blocked_apps": [],
     "blocked_sites": [],
     "pending_actions": []
@@ -94,26 +119,190 @@ def load_state():
             with open(state_path, "r") as f:
                 loaded = json.load(f)
                 with STATE_LOCK:
+                    if not isinstance(loaded, dict) or not isinstance(loaded.get("is_locked"), bool):
+                        raise ValueError("Invalid cached lock state")
                     local_state.update(loaded)
+                    # Older clients stored bare action names. They have no server
+                    # version, so replaying them could undo a newer staff command.
+                    pending = local_state.get("pending_actions", [])
+                    if not isinstance(pending, list):
+                        pending = []
+                    local_state["pending_actions"] = [
+                        action for action in pending
+                        if isinstance(action, dict)
+                        and action.get("action") in ("force-lock", "force-unlock", "start-session")
+                        and (action.get("expected_version") is None or
+                             (isinstance(action.get("expected_version"), int)
+                              and not isinstance(action.get("expected_version"), bool)))
+                        and isinstance(action.get("id"), str)
+                    ][-1:]
+            with STATE_LOCK:
+                local_state["applied_control_version"] = None
+                local_state["attempted_control_version"] = None
+                local_state["control_error"] = None
+                if not local_state["is_locked"]:
+                    if not local_state.get("expires_at") and local_state.get("from_when") and local_state.get("duration"):
+                        from datetime import timedelta
+                        local_state["expires_at"] = (utc(local_state["from_when"]) + timedelta(seconds=local_state["duration"])).isoformat()
+                    SESSION_CLOCK.restore(local_state.get("control_version"), local_state.get("session_id"),
+                                          local_state.get("expires_at"), local_state.get("server_offset_seconds", 0))
             logging.info("State successfully loaded from file.")
         except Exception as e:
+            with STATE_LOCK:
+                local_state.update(is_locked=True, pending_actions=[], expires_at=None,
+                                   from_when=None, duration=None, control_version=None)
+                SESSION_CLOCK.clear()
             logging.error(f"Error loading state from file: {e}")
     else:
         save_state()
 
 def save_state():
     try:
-        with STATE_LOCK:
-            state_copy = dict(local_state)
-        temp_path = state_path + ".tmp"
-        with open(temp_path, "w") as f:
-            json.dump(state_copy, f, indent=2)
-        os.replace(temp_path, state_path)
+        with SAVE_LOCK:
+            with STATE_LOCK:
+                state_copy = copy.deepcopy(local_state)
+            temp_path = state_path + ".tmp"
+            with open(temp_path, "w") as f:
+                json.dump(state_copy, f, indent=2)
+            os.replace(temp_path, state_path)
     except Exception as e:
         logging.error(f"Error saving state to file: {e}")
 
 # Event to trigger heartbeat wakeups immediately upon manual action
 heartbeat_event = threading.Event()
+
+def _set_local_control_locked(locked, action):
+    local_state["is_locked"] = locked
+    local_state["from_when"] = None
+    local_state["duration"] = None
+    local_state["expires_at"] = None
+    local_state["session_id"] = None
+    local_state["applied_control_version"] = None
+    local_state["attempted_control_version"] = None
+    local_state["control_error"] = None
+    SESSION_CLOCK.clear()
+    pending = {"id": uuid.uuid4().hex, "action": action,
+               "expected_version": local_state.get("control_version")}
+    local_state["pending_actions"] = [pending]
+    return pending["id"]
+
+
+def set_local_control(locked, action, expected_version=None):
+    with STATE_LOCK:
+        if expected_version is not None and expected_version != local_state.get("control_version"):
+            return None
+        pending_id = _set_local_control_locked(locked, action)
+    save_state()
+    heartbeat_event.set()
+    return pending_id
+
+
+def authorize_local_access(password, minutes=None):
+    """Both local actions require the configured staff password, without network I/O."""
+    import hmac
+    configured = config.get("master_password")
+    if not isinstance(configured, str) or not configured or not isinstance(password, str):
+        raise ValueError("Password petugas belum diatur.")
+    if not hmac.compare_digest(password.encode(), configured.encode()):
+        raise ValueError("Password petugas salah.")
+    if minutes is None:
+        return set_local_control(False, "force-unlock")
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or not 1 <= minutes <= 1440:
+        raise ValueError("Durasi harus 1–1440 menit.")
+    seconds = minutes * 60
+    with STATE_LOCK:
+        pending_id = _set_local_control_locked(False, "start-session")
+        now = datetime.now(timezone.utc) + timedelta(seconds=local_state.get("server_offset_seconds", 0))
+        expiry = (now + timedelta(seconds=seconds)).isoformat()
+        local_state.update(from_when=now.isoformat(), duration=seconds,
+                           expires_at=expiry, session_id="local:" + pending_id)
+        local_state["pending_actions"][0]["expires_at"] = expiry
+        SESSION_CLOCK.sync(local_state.get("control_version"), local_state["session_id"], expiry, now.isoformat())
+    save_state()
+    heartbeat_event.set()
+    logging.info("Staff started a local timed session for %s minutes.", minutes)
+    return pending_id
+
+
+def enqueue_gui(callback):
+    GUI_COMMANDS.put(callback)
+
+
+def process_gui_commands():
+    for _ in range(100):
+        try:
+            callback = GUI_COMMANDS.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            callback()
+        except Exception as error:
+            logging.error("GUI callback failed: %s", error)
+    root.after(50, process_gui_commands)
+
+
+def apply_gui_control(version):
+    with STATE_LOCK:
+        if version != local_state.get("control_version") or local_state["pending_actions"]:
+            return
+        before = (local_state.get("applied_control_version"), local_state.get("control_error"))
+        local_state["attempted_control_version"] = version
+        try:
+            if local_state["is_locked"]:
+                show_lock_screen_gui()
+            else:
+                hide_lock_screen_gui()
+            local_state["applied_control_version"] = version
+            local_state["control_error"] = None
+        except Exception as error:
+            local_state["applied_control_version"] = None
+            local_state["control_error"] = re.sub(r'[\x00-\x1f\x7f]', ' ', str(error))[:500]
+            logging.error("Could not apply control version %s: %s", version, error)
+        changed = before != (local_state.get("applied_control_version"), local_state.get("control_error"))
+    if changed:
+        save_state()
+        heartbeat_event.set()
+
+
+def apply_local_gui(pending_id):
+    with STATE_LOCK:
+        pending = local_state["pending_actions"]
+        if not pending or pending[0].get("id") != pending_id:
+            return
+        try:
+            if local_state["is_locked"]:
+                show_lock_screen_gui()
+            else:
+                hide_lock_screen_gui()
+        except Exception as error:
+            local_state["attempted_control_version"] = local_state.get("control_version")
+            local_state["control_error"] = re.sub(r'[\x00-\x1f\x7f]', ' ', str(error))[:500]
+    save_state()
+    heartbeat_event.set()
+
+
+def restore_gui_state():
+    with STATE_LOCK:
+        pending = local_state["pending_actions"]
+        pending_id = pending[0].get("id") if pending else None
+        version = local_state.get("control_version")
+    if pending_id:
+        apply_local_gui(pending_id)
+    else:
+        apply_gui_control(version)
+
+
+def expire_local_session():
+    with STATE_LOCK:
+        remaining = SESSION_CLOCK.remaining()
+        if local_state["is_locked"] or remaining is None or remaining > 0:
+            return False
+        pending_id = _set_local_control_locked(True, "force-lock")
+    save_state()
+    heartbeat_event.set()
+    enqueue_gui(lambda: apply_local_gui(pending_id))
+    return True
+
 
 # 5. Helpers for System Status
 def get_agent_hostname():
@@ -247,7 +436,7 @@ def unblock_domain(domain):
         if "127.0.0.1" in line_stripped:
             parts = line_stripped.split()
             if len(parts) >= 2 and parts[0] == "127.0.0.1":
-                if parts[1] in targets:
+                if parts[1] in targets and "# agent-blocked" in line_stripped:
                     is_match = True
         
         if is_match:
@@ -266,26 +455,39 @@ def unblock_domain(domain):
     return removed
 
 def sync_hosts_file(blocked_sites):
-    current_blocked = get_blocked_sites()
-    to_block = [d.strip().lower() for d in blocked_sites if d.strip()]
+    with HOSTS_LOCK:
+        current_blocked = get_blocked_sites()
+        to_block = [d.strip().lower() for d in blocked_sites if d.strip()]
     
-    for domain in to_block:
-        if domain not in current_blocked:
-            block_domain(domain)
-            logging.info(f"Blocked domain: {domain}")
+        for domain in to_block:
+            if domain not in current_blocked:
+                block_domain(domain)
+                logging.info(f"Blocked domain: {domain}")
             
-    for domain in current_blocked:
-        if domain not in to_block:
-            unblock_domain(domain)
-            logging.info(f"Unblocked domain: {domain}")
+        for domain in current_blocked:
+            if domain not in to_block:
+                unblock_domain(domain)
+                logging.info(f"Unblocked domain: {domain}")
+
+def restore_cached_site_policy():
+    try:
+        with HOSTS_LOCK:
+            with STATE_LOCK:
+                sites = list(local_state.get("blocked_sites", []))
+            sync_hosts_file(sites)
+    except Exception as error:
+        logging.error("Cached website policy could not be restored: %s", error)
+
 
 # 7. GUI Kiosk Screen Operations (Must be executed on main Tkinter thread)
 def show_lock_screen_gui():
-    global lock_window, is_locked
+    global lock_window, is_locked, lock_health_error
     with gui_lock:
         if is_locked:
+            if lock_health_error:
+                raise RuntimeError(lock_health_error)
             return
-        is_locked = True
+    keyboard_error = None
 
     lock_window = tk.Toplevel(root)
     lock_window.configure(bg="black")
@@ -306,8 +508,10 @@ def show_lock_screen_gui():
             keyboard.add_hotkey('ctrl+esc', lambda: None, suppress=True)
             keyboard.add_hotkey('windows+d', lambda: None, suppress=True)
             keyboard.add_hotkey('windows+r', lambda: None, suppress=True)
-        except Exception:
-            pass
+        except Exception as error:
+            keyboard_error = str(error)
+    elif os.name == 'nt':
+        keyboard_error = 'Keyboard hook dependency is unavailable'
 
     # Binding events to reject default Tkinter close shortcuts
     lock_window.bind_all("<Alt-F4>", lambda e: "break")
@@ -327,107 +531,95 @@ def show_lock_screen_gui():
     # Re-apply grab if window loses focus
     lock_window.bind("<FocusOut>", lambda e: lock_window.after(1, re_grab))
 
-    # Kiosk interface elements
-    frame = tk.Frame(lock_window, bg="black")
+    # Visitor instructions and local staff controls share a clear, responsive layout.
+    bg = "#101923"
+    lock_window.configure(bg=bg)
+    frame = tk.Frame(lock_window, bg=bg, padx=36, pady=24)
     frame.place(relx=0.5, rely=0.5, anchor="center")
-
-    label = tk.Label(
-        frame, 
-        text="Komputer Terkunci. Silahkan hubungi petugas untuk menggunakan komputer.",
-        font=("Helvetica", 24, "bold"),
-        fg="white",
-        bg="black",
-        wraplength=800
-    )
-    label.pack(pady=30)
-
-    pwd_frame = tk.Frame(frame, bg="black")
-    pwd_frame.pack(pady=10)
-
-    pwd_label = tk.Label(
-        pwd_frame,
-        text="Masukkan Master Password :",
-        font=("Helvetica", 14),
-        fg="#aaaaaa",
-        bg="black"
-    )
-    pwd_label.pack(side="left", padx=5)
-
-    pwd_entry = tk.Entry(
-        pwd_frame,
-        show="*",
-        font=("Helvetica", 14),
-        bg="#222222",
-        fg="white",
-        insertbackground="white",
-        bd=1,
-        relief="flat"
-    )
-    pwd_entry.pack(side="left", padx=5)
-
-    error_label = tk.Label(
-        frame,
-        text="",
-        font=("Helvetica", 12),
-        fg="red",
-        bg="black"
-    )
-    error_label.pack(pady=10)
-
-    def handle_pwd_unlock(event=None):
-        entered = pwd_entry.get()
-        if entered == config.get("master_password"):
-            global local_state
-            with STATE_LOCK:
-                local_state["is_locked"] = False
-                local_state["from_when"] = None
-                local_state["duration"] = None
-                if "force-unlock" not in local_state["pending_actions"]:
-                    local_state["pending_actions"].append("force-unlock")
-            save_state()
-            
-            hide_lock_screen_gui()
-            heartbeat_event.set()
-        else:
+    wrap = max(280, min(720, lock_window.winfo_screenwidth() - 100))
+    tk.Label(frame, text="SIPANTAU  /  " + get_agent_hostname(), font=("Segoe UI", 12),
+             fg="#8aa5bb", bg=bg).pack(pady=(0, 18))
+    tk.Label(frame, text="Komputer terkunci", font=("Segoe UI", 30, "bold"),
+             fg="#f1f5f9", bg=bg).pack()
+    tk.Label(frame, text="Hubungi petugas untuk memulai sesi penggunaan.",
+             font=("Segoe UI", 14), fg="#becbd6", bg=bg, wraplength=wrap).pack(pady=(10, 20))
+    status = tk.Label(frame, font=("Segoe UI", 11), bg=bg)
+    status.pack(pady=(0, 22))
+    def update_connection_status():
+        if not lock_window or not status.winfo_exists():
+            return
+        connected = LAST_HEARTBEAT is not None and time.monotonic() - LAST_HEARTBEAT < 60
+        status.config(text="Terhubung ke server" if connected else
+                      "Server tidak terhubung · akses petugas tetap tersedia",
+                      fg="#73d4b0" if connected else "#e4bb78")
+        status.after(2000, update_connection_status)
+    update_connection_status()
+    tk.Label(frame, text="Akses petugas", font=("Segoe UI", 13, "bold"),
+             fg="#f1f5f9", bg=bg).pack(anchor="w")
+    pwd_entry = tk.Entry(frame, show="*", font=("Segoe UI", 14), bg="#213142",
+                         fg="white", insertbackground="white", relief="flat", width=28)
+    pwd_entry.pack(fill="x", pady=(10, 14), ipady=8)
+    tk.Label(frame, text="Durasi sesi (menit)", font=("Segoe UI", 11),
+             fg="#becbd6", bg=bg).pack(anchor="w")
+    minutes = tk.StringVar(value="60")
+    duration_entry = tk.Spinbox(frame, from_=1, to=1440, textvariable=minutes,
+                               font=("Segoe UI", 14), width=8, bg="#213142", fg="white",
+                               insertbackground="white", relief="flat")
+    duration_entry.pack(anchor="w", pady=8)
+    presets = tk.Frame(frame, bg=bg)
+    presets.pack(anchor="w", pady=(0, 12))
+    for value in (30, 60, 120):
+        tk.Button(presets, text=f"{value} menit", command=lambda v=value: minutes.set(str(v)),
+                  bg="#213142", fg="white", relief="flat", padx=12, pady=5).pack(side="left", padx=(0, 8))
+    error_label = tk.Label(frame, text="", font=("Segoe UI", 11), fg="#ffb4b4",
+                           bg=bg, wraplength=wrap)
+    error_label.pack()
+    def handle_access(timed=True):
+        try:
+            duration = int(minutes.get()) if timed else None
+            pending_id = authorize_local_access(pwd_entry.get(), duration)
             pwd_entry.delete(0, tk.END)
-            error_label.config(text="Master Password Salah.")
-            lock_window.after(3000, lambda: error_label.config(text=""))
-
-    pwd_entry.bind("<Return>", handle_pwd_unlock)
-
-    btn = tk.Button(
-        pwd_frame,
-        text="Buka Kunci",
-        font=("Helvetica", 12, "bold"),
-        bg="#444444",
-        fg="white",
-        activebackground="#555555",
-        activeforeground="white",
-        relief="flat",
-        command=handle_pwd_unlock
-    )
-    btn.pack(side="left", padx=10)
-
+            apply_local_gui(pending_id)
+        except ValueError as error:
+            pwd_entry.delete(0, tk.END)
+            error_label.config(text=str(error))
+    tk.Button(frame, text="Mulai sesi dengan timer", font=("Segoe UI", 12, "bold"),
+              bg="#317d9b", fg="white", activebackground="#24647e", activeforeground="white",
+              relief="flat", pady=10, command=handle_access).pack(fill="x", pady=(10, 8))
+    tk.Button(frame, text="Buka tanpa batas waktu", font=("Segoe UI", 11),
+              bg="#213142", fg="#becbd6", relief="flat", pady=8,
+              command=lambda: handle_access(False)).pack(fill="x")
+    pwd_entry.bind("<Return>", lambda event: handle_access(True))
     pwd_entry.focus_set()
+    with gui_lock:
+        is_locked = True
+    lock_health_error = 'Lock screen visible but shortcut blocking failed: ' + keyboard_error if keyboard_error else None
+    if lock_health_error:
+        raise RuntimeError(lock_health_error)
 
 def hide_lock_screen_gui():
-    global lock_window, is_locked
+    global lock_window, is_locked, lock_health_error
     with gui_lock:
-        if not is_locked:
+        if not is_locked and not lock_health_error:
             return
-        is_locked = False
+    keyboard_error = None
 
     # Remove low-level Windows keyboard hooks
     if os.name == 'nt' and keyboard:
         try:
             keyboard.unhook_all()
-        except Exception:
-            pass
+        except Exception as error:
+            keyboard_error = str(error)
 
     if lock_window:
         lock_window.grab_release()
         lock_window.destroy()
         lock_window = None
+    with gui_lock:
+        is_locked = False
+    lock_health_error = 'Shortcut hooks could not be released: ' + keyboard_error if keyboard_error else None
+    if lock_health_error:
+        raise RuntimeError(lock_health_error)
 
 def rearrange_notifications():
     with notification_lock:
@@ -575,17 +767,8 @@ def drag_motion(event):
 # --- Stop session action ---
 def stop_session_action():
     if messagebox.askyesno("Hentikan Sesi", "Apakah Anda yakin ingin menghentikan sesi sekarang?\nKomputer Anda akan langsung dikunci."):
-        global local_state
-        with STATE_LOCK:
-            local_state["is_locked"] = True
-            local_state["from_when"] = None
-            local_state["duration"] = None
-            if "force-lock" not in local_state["pending_actions"]:
-                local_state["pending_actions"].append("force-lock")
-        save_state()
-        
-        show_lock_screen_gui()
-        heartbeat_event.set()
+        pending_id = set_local_control(True, "force-lock")
+        apply_local_gui(pending_id)
 
 # --- Floating countdown timer widget ---
 def show_timer_window_gui():
@@ -682,21 +865,8 @@ def update_timer_layout():
         return
         
     with STATE_LOCK:
-        is_locked_local = local_state["is_locked"]
-        from_when_local = local_state["from_when"]
-        duration_local = local_state["duration"]
-        
-    remaining = 0
-    if not is_locked_local and from_when_local and duration_local:
-        try:
-            cleaned_time = from_when_local.replace("Z", "+00:00")
-            started_at = datetime.fromisoformat(cleaned_time)
-            now_utc = datetime.now(timezone.utc)
-            elapsed = (now_utc - started_at).total_seconds()
-            remaining = int(duration_local - elapsed)
-        except Exception:
-            pass
-            
+        remaining = int(SESSION_CLOCK.remaining() or 0)
+
     if remaining <= 0:
         if timer_window is not None:
             try:
@@ -812,20 +982,10 @@ def update_timer_gui():
     global timer_window
     
     with STATE_LOCK:
-        is_locked_local = local_state["is_locked"]
-        from_when_local = local_state["from_when"]
-        duration_local = local_state["duration"]
-        
-    if not is_locked_local and from_when_local and duration_local:
-        try:
-            cleaned_time = from_when_local.replace("Z", "+00:00")
-            started_at = datetime.fromisoformat(cleaned_time)
-            now_utc = datetime.now(timezone.utc)
-            elapsed = (now_utc - started_at).total_seconds()
-            remaining = int(duration_local - elapsed)
-        except Exception:
-            remaining = 0
-            
+        remaining = SESSION_CLOCK.remaining()
+        active = not local_state["is_locked"] and remaining is not None
+
+    if active:
         if remaining > 0:
             if timer_window is None:
                 show_timer_window_gui()
@@ -866,7 +1026,7 @@ def blacklist_watcher():
                             logging.info(msg)
                             print(msg)
                             if root:
-                                root.after(0, lambda n=name: trigger_kill_notification(n))
+                                enqueue_gui(lambda n=name: trigger_kill_notification(n))
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
         except Exception as e:
@@ -875,103 +1035,137 @@ def blacklist_watcher():
         time.sleep(15)
 
 # 9. Background Heartbeat Thread
-def heartbeat_loop():
-    global local_state
-    server_url = config.get("server_url", "")
-    api_key = config.get("api_key", "")
+
+def agent_headers():
+    return {"X-API-Key": config.get("api_key", ""),
+            "X-Pantau-Hostname": get_agent_hostname(), "Content-Type": "application/json"}
+
+
+def discard_pending(pending):
+    with STATE_LOCK:
+        local_state["pending_actions"] = [item for item in local_state["pending_actions"]
+                                            if item.get("id") != pending.get("id")]
+    save_state()
+
+
+def flush_pending_action(server_url, headers, verify_ssl):
+    global LOCAL_ADOPTION
+    with STATE_LOCK:
+        actions = copy.deepcopy(local_state.get("pending_actions", []))
+    for pending in actions:
+        version = pending.get("expected_version")
+        if not isinstance(version, int) or isinstance(version, bool):
+            discard_pending(pending)
+            continue
+        try:
+            payload = {"hostname": get_agent_hostname(), "ip": get_local_ip(), "expected_version": version}
+            if pending["action"] == "start-session":
+                with STATE_LOCK:
+                    current = local_state["pending_actions"]
+                    if not current or current[0]["id"] != pending["id"]:
+                        continue
+                    remaining = SESSION_CLOCK.remaining()
+                if remaining is None or remaining <= 0:
+                    expire_local_session()
+                    continue
+                import math
+                payload.update(remaining_seconds=min(86400, math.ceil(remaining)), expires_at=pending["expires_at"])
+            response = requests.post(f"{server_url}/api/pantau/action/{pending['action']}",
+                                     json=payload,
+                                     headers=headers, timeout=5, verify=verify_ssl)
+            if response.status_code in (200, 201):
+                new_version = response.json()["control_version"]
+                if not isinstance(new_version, int) or isinstance(new_version, bool):
+                    raise ValueError('Invalid action control_version')
+                NETWORK_LOG.recovered('local-action')
+                with STATE_LOCK:
+                    local_state["control_version"] = new_version
+                    current = local_state["pending_actions"]
+                    if current and current[0].get("id") == pending.get("id"):
+                        if pending["action"] == "start-session":
+                            LOCAL_ADOPTION = (new_version, SESSION_CLOCK.deadline)
+                        local_state["pending_actions"] = []
+                    elif current and current[0].get("expected_version") == version:
+                        current[0]["expected_version"] = new_version
+                save_state()
+            elif response.status_code in (409, 422):
+                discard_pending(pending)
+                logging.warning('Discarded stale or invalid local action: %s', pending['action'])
+            else:
+                NETWORK_LOG.failure('local-action', 'HTTP %s' % response.status_code)
+        except Exception as error:
+            NETWORK_LOG.failure('local-action', error)
+
+
+def accept_server_state(data, round_trip):
+    global LAST_HEARTBEAT, LOCAL_ADOPTION
+    version = data.get("control_version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+        raise ValueError('Invalid heartbeat control_version')
+    if not isinstance(data.get("is_locked"), (bool, int)) or data.get("is_locked") not in (0, 1):
+        raise ValueError('Invalid heartbeat lock state')
+    server_now = utc(data['server_now'])
+    LAST_HEARTBEAT = time.monotonic()
+    NETWORK_LOG.recovered('heartbeat')
+    with STATE_LOCK:
+        previous = local_state.get("control_version")
+        if previous is not None and version < previous:
+            return
+        pending = local_state["pending_actions"]
+        # A newer server decision supersedes an offline local action, including
+        # a previously accepted action whose response was lost.
+        if pending and pending[0].get("expected_version") != version:
+            local_state["pending_actions"] = []
+        local_state["control_version"] = version
+        if local_state["pending_actions"]:
+            return
+        locked = bool(data["is_locked"])
+        expires_at = None if locked else data.get("expires_at")
+        SESSION_CLOCK.sync(version, data.get("session_id"), expires_at, data['server_now'], round_trip)
+        if LOCAL_ADOPTION and LOCAL_ADOPTION[0] == version and SESSION_CLOCK.deadline is not None:
+            SESSION_CLOCK.deadline = min(SESSION_CLOCK.deadline, LOCAL_ADOPTION[1])
+        LOCAL_ADOPTION = None
+        local_state["is_locked"] = locked
+        local_state["from_when"] = data.get("from_when") if not locked else None
+        local_state["duration"] = data.get("duration") if not locked else None
+        local_state["session_id"] = data.get("session_id") if not locked else None
+        local_state["expires_at"] = expires_at
+        local_state["server_offset_seconds"] = (server_now - datetime.now(timezone.utc)).total_seconds() + round_trip / 2
+    save_state()
+    enqueue_gui(lambda v=version: apply_gui_control(v))
+
+
+def heartbeat_once():
+    server_url = config.get("server_url", "").rstrip('/')
+    if not server_url:
+        return
     verify_ssl = config.get("verify_ssl", True)
-    
-    if not verify_ssl:
+    headers = agent_headers()
+    flush_pending_action(server_url, headers, verify_ssl)
+    with gui_lock:
+        actual_locked = bool(is_locked)
+    with STATE_LOCK:
+        payload = {"hostname": get_agent_hostname(), "ip": get_local_ip(),
+                   "running_apps": get_running_apps(), "reported_is_locked": actual_locked,
+                   "applied_control_version": local_state.get("applied_control_version"),
+                   "attempted_control_version": local_state.get("attempted_control_version"),
+                   "control_error": local_state.get("control_error")}
+    started = time.monotonic()
+    response = requests.post(f"{server_url}/api/pantau/heartbeat", json=payload,
+                             headers=headers, timeout=5, verify=verify_ssl)
+    if response.status_code not in (200, 201):
+        raise RuntimeError(f'Heartbeat failed with HTTP {response.status_code}')
+    accept_server_state(response.json(), time.monotonic() - started)
+
+
+def heartbeat_loop():
+    if not config.get("verify_ssl", True):
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    
-    headers = {
-        "X-API-Key": api_key,
-        "Content-Type": "application/json"
-    }
-    
     while True:
         try:
-            if not server_url:
-                time.sleep(5)
-                continue
-            
-            # Flush pending actions first
-            with STATE_LOCK:
-                actions = list(local_state.get("pending_actions", []))
-            
-            success_actions = []
-            failed = False
-            for act in actions:
-                url_act = f"{server_url.rstrip('/')}/api/pantau/action/{act}"
-                payload_act = {
-                    "hostname": get_agent_hostname(),
-                    "ip": get_local_ip()
-                }
-                try:
-                    res = requests.post(url_act, json=payload_act, headers=headers, timeout=5, verify=verify_ssl)
-                    if res.status_code in (200, 201):
-                        success_actions.append(act)
-                        logging.info(f"Successfully posted pending action: {act}")
-                    else:
-                        logging.error(f"Failed to post action {act}: status code {res.status_code}")
-                        failed = True
-                        break
-                except Exception as ex:
-                    logging.error(f"Connection error posting action {act}: {ex}")
-                    failed = True
-                    break
-            
-            if success_actions:
-                with STATE_LOCK:
-                    for act in success_actions:
-                        if act in local_state["pending_actions"]:
-                            local_state["pending_actions"].remove(act)
-                save_state()
-            
-            if failed:
-                # Sleep or wait event before retrying pending actions
-                heartbeat_event.wait(5)
-                heartbeat_event.clear()
-                continue
-            
-            # Perform normal heartbeat
-            url_hb = f"{server_url.rstrip('/')}/api/pantau/heartbeat"
-            payload_hb = {
-                "hostname": get_agent_hostname(),
-                "ip": get_local_ip(),
-                "running_apps": get_running_apps()
-            }
-            
-            res = requests.post(url_hb, json=payload_hb, headers=headers, timeout=5, verify=verify_ssl)
-            if res.status_code in (200, 201):
-                data = res.json()
-                is_locked_srv = data.get("is_locked", True)
-                from_when_srv = data.get("from_when")
-                duration_srv = data.get("duration")
-                
-                with STATE_LOCK:
-                    local_state["is_locked"] = is_locked_srv
-                    local_state["from_when"] = from_when_srv
-                    local_state["duration"] = duration_srv
-                save_state()
-                
-                if is_locked_srv:
-                    root.after(0, show_lock_screen_gui)
-                else:
-                    root.after(0, hide_lock_screen_gui)
-            else:
-                logging.error(f"Heartbeat failed with code {res.status_code}: {res.text}")
-                
-        except Exception as e:
-            logging.error(f"Heartbeat exception: {e}")
-            with STATE_LOCK:
-                offline_locked = local_state["is_locked"]
-            if offline_locked:
-                root.after(0, show_lock_screen_gui)
-            else:
-                root.after(0, hide_lock_screen_gui)
-                
-        # Wait 5 seconds or wait until manual action sets event
+            heartbeat_once()
+        except Exception as error:
+            NETWORK_LOG.failure('heartbeat', error)
         heartbeat_event.wait(5)
         heartbeat_event.clear()
 
@@ -979,13 +1173,9 @@ def heartbeat_loop():
 def blocklist_sync_loop():
     global local_state
     server_url = config.get("server_url", "")
-    api_key = config.get("api_key", "")
     verify_ssl = config.get("verify_ssl", True)
     
-    headers = {
-        "X-API-Key": api_key,
-        "Content-Type": "application/json"
-    }
+    headers = agent_headers()
     
     while True:
         try:
@@ -997,9 +1187,12 @@ def blocklist_sync_loop():
             res = requests.get(url, headers=headers, timeout=5, verify=verify_ssl)
             if res.status_code == 200:
                 data = res.json()
-                banned_apps = data.get("blocked_apps") or data.get("blacklisted_apps", [])
+                banned_apps = data.get("blocked_apps", data.get("blacklisted_apps", []))
                 blocked_sites = data.get("blocked_sites", [])
-                
+                if not isinstance(banned_apps, list) or not isinstance(blocked_sites, list) or any(
+                        not isinstance(item, str) for item in banned_apps + blocked_sites):
+                    raise ValueError("Invalid blocklist response")
+                NETWORK_LOG.recovered('blocklist')
                 with STATE_LOCK:
                     local_state["blocked_apps"] = banned_apps
                     local_state["blocked_sites"] = blocked_sites
@@ -1008,51 +1201,77 @@ def blocklist_sync_loop():
                 # Sync sites list to local hosts mapping
                 sync_hosts_file(blocked_sites)
             else:
-                logging.error(f"Blocklist fetch failed with code {res.status_code}")
+                NETWORK_LOG.failure('blocklist', 'HTTP %s' % res.status_code)
         except Exception as e:
-            logging.error(f"Blocklist sync exception: {e}")
+            NETWORK_LOG.failure('blocklist', e)
             
         time.sleep(180)
 
 # 11. Local Session Countdown Timer Thread
 def session_timer_loop():
-    global local_state
     while True:
         try:
-            with STATE_LOCK:
-                is_locked_local = local_state["is_locked"]
-                from_when_local = local_state["from_when"]
-                duration_local = local_state["duration"]
-                
-            if not is_locked_local and from_when_local and duration_local:
-                try:
-                    cleaned_time = from_when_local.replace("Z", "+00:00")
-                    started_at = datetime.fromisoformat(cleaned_time)
-                    now_utc = datetime.now(timezone.utc)
-                    elapsed = (now_utc - started_at).total_seconds()
-                    remaining = duration_local - elapsed
-                    
-                    if remaining <= 0:
-                        logging.info("Local session countdown expired. Locking PC.")
-                        with STATE_LOCK:
-                            local_state["is_locked"] = True
-                            local_state["from_when"] = None
-                            local_state["duration"] = None
-                            if "force-lock" not in local_state["pending_actions"]:
-                                local_state["pending_actions"].append("force-lock")
-                        save_state()
-                        
-                        root.after(0, show_lock_screen_gui)
-                        heartbeat_event.set()
-                except Exception as ex:
-                    logging.error(f"Error parsing session start time: {ex}")
-        except Exception as e:
-            logging.error(f"Error in session timer loop: {e}")
-            
+            if expire_local_session():
+                logging.info('Local session expired; locking PC.')
+        except Exception as error:
+            logging.error('Local countdown failed: %s', error)
         time.sleep(1)
+
+def update_allowed():
+    with STATE_LOCK:
+        with gui_lock:
+            return (local_state["is_locked"] and is_locked and not lock_health_error
+                    and SESSION_CLOCK.remaining() is None and not local_state["pending_actions"])
+
+
+def install_release(staged, tag, digest):
+    from pathlib import Path
+    from windows_runtime import lock_for_update
+    from updater import installer_script
+    with STATE_LOCK:
+        if not update_allowed():
+            return
+        directory = Path(config_path).parent
+        marker = directory / ("update-health-" + uuid.uuid4().hex + ".ready")
+        helper = directory / "update-install.ps1"
+        helper.write_text(installer_script(sys.executable, staged, marker, os.getpid(), digest, tag), encoding="utf-8-sig")
+        # Native Windows lock keeps the desktop protected while the Tk process restarts.
+        if not lock_for_update():
+            raise RuntimeError("Windows could not lock the workstation for update")
+        subprocess.Popen(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                          "-File", str(helper)], creationflags=subprocess.CREATE_NO_WINDOW)
+        logging.info("Installing verified update %s; previous executable retained for rollback.", tag)
+        logging.shutdown()
+        os._exit(0)
+
+
+
+def report_update_ready():
+    from updater import signal_ready
+    with STATE_LOCK:
+        with gui_lock:
+            healthy = not lock_health_error and local_state["is_locked"] == is_locked
+            signal_ready(os.path.dirname(config_path), is_locked, healthy)
+    # Readiness can arrive after a queued control action; the helper waits up to 180 seconds.
+    if root:
+        root.after(1000, report_update_ready)
+
 
 # Main Application Entrypoint
 if __name__ == "__main__":
+    if os.name == 'nt':
+        import ctypes
+        # Prevent two agents (and two rotating log writers) on the same Windows session.
+        ctypes.windll.kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        ctypes.windll.kernel32.CreateMutexW.restype = ctypes.c_void_p
+        instance_mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\SIPANTAUAgent")
+        if not instance_mutex or ctypes.windll.kernel32.GetLastError() == 183:
+            sys.exit(0)
+    from urllib.parse import urlparse
+    server = urlparse(config.get("server_url", ""))
+    if server.scheme not in ('http', 'https') or not server.hostname or len(config.get("api_key", "")) < 32:
+        logging.error('Set a valid server_url and an API key of at least 32 characters in config.json.')
+        sys.exit(1)
     # Initialize Tkinter system first on the main thread
     root = tk.Tk()
     root.withdraw() # Hide root controller window
@@ -1060,14 +1279,19 @@ if __name__ == "__main__":
     # Load persistent state from state.json cache
     load_state()
 
+    # Expired cached sessions must not briefly unlock the desktop on startup.
+    expire_local_session()
+    threading.Thread(target=restore_cached_site_policy, daemon=True).start()
+
     # Configure autorun registration (Windows only)
     update_autorun(config.get("autorun", False))
 
-    # Auto-lock or restore state on run
-    with STATE_LOCK:
-        start_locked = local_state["is_locked"]
-    if start_locked or config.get("auto_lock_on_run", False):
-        root.after(0, show_lock_screen_gui)
+    # Enforce cached local state even when an offline action is awaiting sync.
+    if config.get("auto_lock_on_run", False):
+        set_local_control(True, "force-lock")
+    root.after(0, restore_gui_state)
+
+    root.after(50, process_gui_commands)
 
     # Run the background blacklist process checker
     watcher_thread = threading.Thread(target=blacklist_watcher, daemon=True)
@@ -1084,6 +1308,13 @@ if __name__ == "__main__":
     # Run the local session timer loop
     timer_thread = threading.Thread(target=session_timer_loop, daemon=True)
     timer_thread.start()
+
+    from updater import ReleaseUpdater
+    release_updater = ReleaseUpdater(config, os.path.dirname(config_path), VERSION,
+                                     enqueue_gui, update_allowed, install_release)
+    threading.Thread(target=release_updater.run, daemon=True).start()
+    root.after(1000, report_update_ready)
+    logging.info("SIPANTAU %s started; auto-update enabled: %s", VERSION, release_updater.enabled)
 
     # Start periodic GUI timer updates
     root.after(1000, update_timer_gui)
