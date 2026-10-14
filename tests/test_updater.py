@@ -86,7 +86,8 @@ class UpdaterTests(unittest.TestCase):
     def test_installer_escapes_paths_and_restores_previous_executable_after_failed_readiness(self):
         script = updater.installer_script("C:/Staff's PC/SIPANTAU.exe", 'staged.exe', 'marker', 123, 'a'*64, 'v1.2.0')
         self.assertIn("Staff''s PC", script)
-        self.assertIn('Get-FileHash', script)
+        self.assertNotIn('(Get-FileHash ', script)
+        self.assertIn('[System.Security.Cryptography.SHA256]::Create()', script)
         self.assertIn('GetProcessById(123)', script)
         self.assertIn('WaitForExit(60000)', script)
         self.assertIn("Save-Outcome 'rolled-back'", script)

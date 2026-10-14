@@ -129,7 +129,18 @@ try {{
         finally {{ $parentProcess.Dispose() }}
     }}
     $phase = 'verify-download'
-    if ((Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash.ToLowerInvariant() -ne {ps_quote(digest)}) {{
+    # Use .NET directly: Get-FileHash may be unavailable in an inherited PowerShell environment.
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    $hashStream = $null
+    try {{
+        $hashStream = [System.IO.File]::OpenRead($staged)
+        $stagedHash = [System.BitConverter]::ToString($hasher.ComputeHash($hashStream)).Replace('-', '').ToLowerInvariant()
+    }} finally {{
+        # Release the executable handle before replacement, even if hashing fails.
+        if ($hashStream) {{ $hashStream.Dispose() }}
+        $hasher.Dispose()
+    }}
+    if ($stagedHash -ne {ps_quote(digest)}) {{
         throw 'Staged executable failed verification'
     }}
     $phase = 'replace-executable'

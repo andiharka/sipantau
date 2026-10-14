@@ -86,7 +86,10 @@ class WindowsInstallerTests(unittest.TestCase):
         parent = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(1)'])
         try:
             digest = '0'*64 if wrong_digest else hashlib.sha256(staged.read_bytes()).hexdigest()
-            script.write_text(installer_script(target, staged, marker, parent.pid, digest, 'v1.2.0'), encoding='utf-8-sig')
+            # Reproduce the missing cmdlet even on hosts where it normally works.
+            unavailable_hash = "function Get-FileHash { throw 'Get-FileHash is deliberately unavailable' }\n"
+            script.write_text(unavailable_hash + installer_script(target, staged, marker, parent.pid, digest, 'v1.2.0'),
+                              encoding='utf-8-sig')
             completed = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
                                         '-File', str(script)], capture_output=True, timeout=75,
                                        text=True, encoding='utf-8', errors='replace')
