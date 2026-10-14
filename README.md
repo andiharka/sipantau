@@ -193,3 +193,9 @@ On a spare Windows PC, verify the three menu actions, keyboard menu navigation, 
 
 
 JPEG server decoding uses a bounded worker so image processing cannot block heartbeat polling. PNG screenshots from older clients remain supported, and previews use the MIME type detected from the stored bytes. No additional database migration is needed for JPEG support. Deploy the server dependency/code update before updating client packages.
+
+### Updater failure diagnostics and CI cleanup
+
+The installer records `phase`, `error`, and the launched `agent_pid` in `update-status.json`. It explicitly handles an already-exited parent, replaces the executable and creates its backup with a single Windows file-replacement operation, and retries transient image locks. Rollback stops the complete PyInstaller process tree before restoring the previous executable. A `rollback-failed` outcome requires staff repair and is skipped by automatic retries.
+
+Windows installer tests use a real temporary parent process. Every test waits for or stops only its own dummy executables before deleting their directory, including when an assertion fails. Checksum rejection, successful readiness and failed-startup rollback are tested separately, with phase/error diagnostics included in failed assertions. The Windows test workflow runs on pull requests independently of tagged releases, so these checks can be verified before publishing a new executable.

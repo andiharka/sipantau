@@ -81,60 +81,119 @@ def ps_quote(value):
 
 
 def installer_script(executable, staged, marker, parent_pid, digest, tag):
-    # All interpolated paths are quoted as PowerShell literals. No shell text from a release is run.
+    # PowerShell literals quote paths; release text is never executed as shell code.
     target = Path(executable)
     backup = target.with_suffix('.previous.exe')
     status = target.parent / 'update-status.json'
-    return f'''$ErrorActionPreference = 'Stop'
+    return fr'''$ErrorActionPreference = 'Stop'
 $target = {ps_quote(target)}
 $staged = {ps_quote(staged)}
 $backup = {ps_quote(backup)}
 $marker = {ps_quote(marker)}
 $status = {ps_quote(status)}
-$child = $null
+$agentProcess = $null
 $replaced = $false
-function Save-Outcome($outcome) {{
-    @{{ version = {ps_quote(tag)}; outcome = $outcome; time = (Get-Date).ToUniversalTime().ToString('o') }} |
+$phase = 'wait-parent'
+function Save-Outcome($outcome, $detail = $null) {{
+    $agentId = $null
+    if ($agentProcess) {{ $agentId = $agentProcess.Id }}
+    @{{ version = {ps_quote(tag)}; outcome = $outcome; phase = $phase; error = $detail;
+        agent_pid = $agentId; time = (Get-Date).ToUniversalTime().ToString('o') }} |
         ConvertTo-Json | Set-Content -LiteralPath $status -Encoding UTF8
 }}
+function Start-Agent($healthCheck) {{
+    $start = @{{ FilePath = $target; WorkingDirectory = {ps_quote(target.parent)}; PassThru = $true }}
+    if ($healthCheck) {{ $start.ArgumentList = '--update-health "' + $marker + '"' }}
+    return Start-Process @start
+}}
+function Stop-AgentTree($process) {{
+    if (!$process) {{ return }}
+    $process.Refresh()
+    if ($process.HasExited) {{ return }}
+    # PyInstaller has a bootloader parent and a Python child; stop both before restoring the image.
+    $previousPreference = $ErrorActionPreference
+    try {{
+        $ErrorActionPreference = 'Continue'
+        & "$env:SystemRoot\System32\taskkill.exe" /PID $process.Id /T /F 2>&1 | Out-Null
+    }} finally {{ $ErrorActionPreference = $previousPreference }}
+    if (!$process.WaitForExit(10000)) {{ throw 'Updated agent process did not stop' }}
+}}
 try {{
-    $parent = Get-Process -Id {int(parent_pid)} -ErrorAction SilentlyContinue
-    if ($parent) {{ Wait-Process -Id {int(parent_pid)} -Timeout 60 }}
-    if ((Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash.ToLower() -ne {ps_quote(digest)}) {{
+    $parentProcess = $null
+    try {{ $parentProcess = [System.Diagnostics.Process]::GetProcessById({int(parent_pid)}) }}
+    catch [System.ArgumentException] {{ }} # The parent may already have exited.
+    if ($parentProcess) {{
+        try {{
+            if (!$parentProcess.WaitForExit(60000)) {{ throw 'Previous agent did not exit within 60 seconds' }}
+        }} catch [System.InvalidOperationException] {{ }}
+        finally {{ $parentProcess.Dispose() }}
+    }}
+    $phase = 'verify-download'
+    if ((Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash.ToLowerInvariant() -ne {ps_quote(digest)}) {{
         throw 'Staged executable failed verification'
     }}
-    Copy-Item -LiteralPath $target -Destination $backup -Force
-    # PyInstaller's parent bootloader may release the executable shortly after its child exits.
+    $phase = 'replace-executable'
     $replaceDeadline = (Get-Date).AddSeconds(30)
     while ($true) {{
-        try {{ Move-Item -LiteralPath $staged -Destination $target -Force; break }}
-        catch {{
+        try {{
+            # One operation replaces the target and saves its previous bytes in the backup.
+            [System.IO.File]::Replace($staged, $target, $backup)
+            $replaced = $true
+            break
+        }} catch [System.IO.IOException] {{
+            if ((Get-Date) -ge $replaceDeadline) {{ throw }}
+            Start-Sleep -Milliseconds 250
+        }} catch [System.UnauthorizedAccessException] {{
             if ((Get-Date) -ge $replaceDeadline) {{ throw }}
             Start-Sleep -Milliseconds 250
         }}
     }}
-    $replaced = $true
+    $phase = 'start-updated-agent'
     Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
-    $arguments = '--update-health "' + $marker + '"'
-    $child = Start-Process -FilePath $target -ArgumentList $arguments -WorkingDirectory {ps_quote(target.parent)} -PassThru
+    $agentProcess = Start-Agent $true
+    $phase = 'wait-readiness'
     $deadline = (Get-Date).AddSeconds(180)
-    while ((Get-Date) -lt $deadline -and !(Test-Path -LiteralPath $marker)) {{
-        if ($child.HasExited) {{ throw 'Updated agent exited before readiness' }}
-        Start-Sleep -Seconds 1
-        $child.Refresh()
+    while ((Get-Date) -lt $deadline) {{
+        $agentProcess.Refresh()
+        if ($agentProcess.HasExited) {{ throw 'Updated agent exited before readiness' }}
+        if (Test-Path -LiteralPath $marker) {{ break }}
+        Start-Sleep -Milliseconds 250
     }}
     if (!(Test-Path -LiteralPath $marker)) {{ throw 'Updated agent readiness timed out' }}
     Remove-Item -LiteralPath $marker -Force
     Save-Outcome 'installed'
 }} catch {{
+    $failure = $_.Exception.Message
+    $failedPhase = $phase
     if ($replaced) {{
-        if ($child -and !$child.HasExited) {{ Stop-Process -Id $child.Id -Force; $child.WaitForExit() }}
-        Copy-Item -LiteralPath $backup -Destination $target -Force
-        Start-Process -FilePath $target -WorkingDirectory {ps_quote(target.parent)}
-        Save-Outcome 'rolled-back'
+        try {{
+            $phase = 'stop-updated-agent'
+            Stop-AgentTree $agentProcess
+            $phase = 'restore-backup'
+            $restoreDeadline = (Get-Date).AddSeconds(30)
+            while ($true) {{
+                try {{ [System.IO.File]::Copy($backup, $target, $true); break }}
+                catch [System.IO.IOException] {{
+                    if ((Get-Date) -ge $restoreDeadline) {{ throw }}
+                    Start-Sleep -Milliseconds 250
+                }} catch [System.UnauthorizedAccessException] {{
+                    if ((Get-Date) -ge $restoreDeadline) {{ throw }}
+                    Start-Sleep -Milliseconds 250
+                }}
+            }}
+            $phase = 'restart-previous-agent'
+            $agentProcess = Start-Agent $false
+            $phase = $failedPhase
+            Save-Outcome 'rolled-back' $failure
+        }} catch {{
+            Save-Outcome 'rollback-failed' ($failure + '; recovery: ' + $_.Exception.Message)
+        }}
     }} else {{
-        Save-Outcome 'failed'
-        Start-Process -FilePath $target -WorkingDirectory {ps_quote(target.parent)}
+        # The original target is intact; restarting must also be observed by the test harness.
+        try {{ $agentProcess = Start-Agent $false }}
+        catch {{ $failure += '; restart: ' + $_.Exception.Message }}
+        $phase = $failedPhase
+        Save-Outcome 'failed' $failure
     }}
 }}
 '''
@@ -178,7 +237,7 @@ class ReleaseUpdater:
             if status_path.exists():
                 try:
                     status = json.loads(status_path.read_text(encoding='utf-8-sig'))
-                    if status.get('version') == tag and status.get('outcome') in ('failed', 'rolled-back'):
+                    if status.get('version') == tag and status.get('outcome') in ('failed', 'rolled-back', 'rollback-failed'):
                         return
                 except (ValueError, OSError):
                     pass
