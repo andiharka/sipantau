@@ -15,7 +15,7 @@ This is a Python-based administration agent designed to run on Windows 10 client
 
 ## Configuration
 
-Place `config.json` beside the complete Python source checkout (or the compiled `.exe`). Keep the helper modules `control_runtime.py`, `client_logging.py`, `updater.py`, `windows_runtime.py`, and `version.py` alongside `agent.py` when running from source. Obtain a shared bootstrap key or an individual PC key from the Perpusip administrator. The API key must contain at least 32 characters.
+Place `config.json` beside the complete Python source checkout (or the compiled `.exe`). Keep the helper modules `control_runtime.py`, `client_logging.py`, `updater.py`, `windows_runtime.py`, `remote_commands.py`, `screenshot_codec.py`, and `version.py` alongside `agent.py` when running from source. Obtain a shared bootstrap key or an individual PC key from the Perpusip administrator. The API key must contain at least 32 characters.
 
 ```json
 {
@@ -23,6 +23,7 @@ Place `config.json` beside the complete Python source checkout (or the compiled 
   "server_url": "http://192.168.1.1:3333",
   "master_password": "set_a_private_local_password",
   "verify_ssl": true,
+  "screenshot_jpeg_quality": 80,
   "auto_update": false,
   "autorun": false,
   "auto_lock_on_run": false,
@@ -35,7 +36,7 @@ Place `config.json` beside the complete Python source checkout (or the compiled 
 ## Installation & Setup
 
 1. **Install Dependencies:**
-   Ensure Python 3.9+ is installed, then run:
+   Ensure Python 3.10+ is installed, then run:
    ```cmd
    pip install -r requirements.txt
    ```
@@ -158,3 +159,37 @@ The log records starts, local timer starts, process blocking, command failures a
 A physical Windows acceptance run is still required for the real fullscreen layout, administrator keyboard hooks, multi-monitor setup, native lock policies, packaged startup, and UAC environment. Unplug networking; start a short local timer and verify expiry; restart during a cached session; verify cached blockers; reconnect after a newer remote command; then test an opt-in update and rollback on a spare PC. Local automated tests cannot prove these Windows desktop interactions.
 
 Further overlay ideas: a collapsible staff panel (cleaner visitor view), keyboard-accessible password visibility toggle, configurable library branding/help contact, scaling across monitor resolutions, and multi-monitor lock coverage. The implemented screen already separates visitor instructions from staff access, shows the PC name and server status, and makes timed access the primary action.
+
+
+## Server screenshot and shutdown commands
+
+The Pantau PC menu now groups **Kunci Agen**, **Ambil Screenshot**, and **Matikan PC**. Update Perpusip and apply `1792022400000_add_pantau_commands` before installing this client. Install the updated requirements (`mss==10.2.0` and `Pillow==12.3.0` are required) or use a packaged release containing this code.
+
+The agent advertises its version, capabilities and a fresh `boot_id` on heartbeat. Screenshot and shutdown buttons are disabled for old clients, offline/revoked PCs, stale dashboard data and PCs already handling a command. Remote commands require a reachable Perpusip server; internet access is not needed when the server is available on the LAN.
+
+### Delivery and failures
+
+Commands have a UUID, current agent boot ID, expected control version and expiry. Undelivered commands expire after 30 seconds; accepted work has a 120-second limit. One command runs per PC. Durable `command-receipts.json` keeps the last 100 IDs, written before acknowledgment or OS actions. Duplicate delivery never repeats a capture or shutdown. A restart creates a different boot ID, cancelling old requests. If the receipt file is corrupt/unwritable, commands are disabled or rejected instead of risking replay; timers and existing controls continue.
+
+No arbitrary shell commands are accepted. The agent reports through `POST /api/pantau/commands/:id/result` and uploads through `POST /api/pantau/commands/:id/image`, using its existing credentials and hostname binding.
+
+### Shutdown
+
+Staff confirms the target PC and any active session. The client displays a local 30-second warning. A newer remote control version, local staff action, or timer expiry cancels the pending shutdown. The final execution permission is checked by Perpusip under the PC row lock. At that point the active session ends and the next-startup desired state is locked. Execution permission is not replayable; losing its response prevents the client from executing shutdown.
+
+The agent then uses the fixed Windows command `shutdown.exe /s /t 0 /d p:0:0`. The warning is implemented locally so the OS command does not imply forced application closure. Unsaved applications can block shutdown. **Submitted** means Windows accepted the shutdown command, not that power-off has been proven; **Offline** can also mean a network failure. If reporting is interrupted, the result may remain unconfirmed. The updater and remote command worker share a guard so they cannot replace the executable during shutdown/capture, and Tk does not wait on their worker lock.
+
+### Screenshots
+
+MSS captures the primary monitor's currently visible desktop. If Pantau is locked, the capture includes its overlay; the agent never hides it to capture underlying content. The native Windows secure desktop is unavailable and returns an explicit error. The encoder compares JPEG at quality 80 with PNG and sends whichever is smaller. JPEG keeps full resolution and full color sampling to preserve colored UI text; simple screens often retain lossless PNG. Set `screenshot_jpeg_quality` to an integer from 40–95 (default 80) to adjust JPEG quality. Images are limited to 10 MiB, 8192 pixels per side and 16 million pixels total. Capture timestamps are derived from the acknowledged server clock plus monotonic elapsed time. Upload retries reuse the same capture.
+
+Perpusip accepts both JPEG and PNG, validates actual image data and dimensions (with bounded decoding), then stores the image privately in `pantau_commands.screenshot_data` in the Perpusip database. It is never exposed through `/uploads`. Authenticated staff can view the preview, capture time and dimensions, or request another capture. Image access has `Cache-Control: no-store`. Images become inaccessible after 24 hours and are removed by scheduler cleanup; command metadata is retained for seven days. Status polling never selects image bytes. Ensure MySQL `max_allowed_packet` permits a 10 MiB image.
+
+### Acceptance checks
+
+Automated tests mock OS shutdown and desktop capture; they never turn off a real PC. They exercise delivery/replay guards, offline timeouts, state changes during countdown, receipt failures, upload retry, secure-desktop errors, native command arguments, updater interaction, authentication, image ownership, JPEG/PNG validation and retention. The Windows release workflow runs these tests before PyInstaller.
+
+On a spare Windows PC, verify the three menu actions, keyboard menu navigation, screenshot preview with unlocked/locked overlay states, unsaved-work warning and shutdown, cancellation by a new session/local staff access, reconnect/restart without replay, and the packaged updater interaction before rollout.
+
+
+JPEG server decoding uses a bounded worker so image processing cannot block heartbeat polling. PNG screenshots from older clients remain supported, and previews use the MIME type detected from the stored bytes. No additional database migration is needed for JPEG support. Deploy the server dependency/code update before updating client packages.

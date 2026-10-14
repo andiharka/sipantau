@@ -60,6 +60,10 @@ logging.basicConfig(
 NETWORK_LOG = NetworkLog()
 LAST_HEARTBEAT = None
 LOCAL_ADOPTION = None
+BOOT_ID = uuid.uuid4().hex
+COMMAND_MANAGER = None
+LOCAL_CONTROL_EPOCH = 0
+HOST_ACTION_LOCK = threading.Lock()
 
 # 3. Dynamic Hosts Path (NT vs Unix development fallback)
 if os.name == 'nt':
@@ -165,13 +169,17 @@ def save_state():
             with open(temp_path, "w") as f:
                 json.dump(state_copy, f, indent=2)
             os.replace(temp_path, state_path)
+        return True
     except Exception as e:
         logging.error(f"Error saving state to file: {e}")
+        return False
 
 # Event to trigger heartbeat wakeups immediately upon manual action
 heartbeat_event = threading.Event()
 
 def _set_local_control_locked(locked, action):
+    global LOCAL_CONTROL_EPOCH
+    LOCAL_CONTROL_EPOCH += 1
     local_state["is_locked"] = locked
     local_state["from_when"] = None
     local_state["duration"] = None
@@ -1149,13 +1157,18 @@ def heartbeat_once():
                    "running_apps": get_running_apps(), "reported_is_locked": actual_locked,
                    "applied_control_version": local_state.get("applied_control_version"),
                    "attempted_control_version": local_state.get("attempted_control_version"),
-                   "control_error": local_state.get("control_error")}
+                   "control_error": local_state.get("control_error"),
+                   "agent_version": VERSION, "boot_id": BOOT_ID,
+                   "capabilities": command_capabilities()}
     started = time.monotonic()
     response = requests.post(f"{server_url}/api/pantau/heartbeat", json=payload,
                              headers=headers, timeout=5, verify=verify_ssl)
     if response.status_code not in (200, 201):
         raise RuntimeError(f'Heartbeat failed with HTTP {response.status_code}')
-    accept_server_state(response.json(), time.monotonic() - started)
+    data = response.json()
+    accept_server_state(data, time.monotonic() - started)
+    if COMMAND_MANAGER:
+        COMMAND_MANAGER.observe(data.get("commands", []), data["server_now"])
 
 
 def heartbeat_loop():
@@ -1217,32 +1230,176 @@ def session_timer_loop():
             logging.error('Local countdown failed: %s', error)
         time.sleep(1)
 
+def command_capabilities():
+    if os.name != 'nt' or COMMAND_MANAGER is None:
+        return []
+    capabilities = ["shutdown"]
+    try:
+        import mss
+        from PIL import Image
+        capabilities.append("screenshot")
+    except ImportError:
+        pass
+    return capabilities
+
+
+def command_guard():
+    with STATE_LOCK:
+        return (local_state.get("control_version"), LOCAL_CONTROL_EPOCH,
+                bool(local_state["pending_actions"]))
+
+
+def command_response(response):
+    from remote_commands import CommandRejected, CommandTransient
+    if response.status_code >= 500:
+        raise CommandTransient("Server unavailable")
+    if response.status_code not in (200, 201):
+        raise CommandRejected("Server rejected command")
+    data = response.json()
+    if data.get("success") is not True:
+        raise CommandRejected("Invalid command response")
+    return data
+
+
+def report_remote_command(command_id, status, error=None):
+    from remote_commands import CommandTransient
+    try:
+        response = requests.post(config["server_url"].rstrip('/') + f"/api/pantau/commands/{command_id}/result",
+                                 json={"hostname": get_agent_hostname(), "boot_id": BOOT_ID, "status": status, "error": error},
+                                 headers=agent_headers(), verify=config.get("verify_ssl", True), timeout=5)
+    except requests.RequestException as error:
+        raise CommandTransient("Command report connection failed") from error
+    return command_response(response)
+
+
+def upload_remote_screenshot(command_id, image, captured_at=None):
+    from remote_commands import CommandTransient
+    from screenshot_codec import image_type
+    mime, extension = image_type(image)
+    headers = agent_headers()
+    headers.pop("Content-Type", None)  # requests generates the multipart boundary.
+    try:
+        response = requests.post(config["server_url"].rstrip('/') + f"/api/pantau/commands/{command_id}/image",
+                                 data={"hostname": get_agent_hostname(), "boot_id": BOOT_ID,
+                                       "captured_at": captured_at or datetime.now(timezone.utc).isoformat()},
+                                 files={"image": (f"screenshot.{extension}", image, mime)},
+                                 headers=headers, verify=config.get("verify_ssl", True), timeout=(5, 15))
+    except requests.RequestException as error:
+        raise CommandTransient("Screenshot upload connection failed") from error
+    return command_response(response)
+
+
+def capture_primary_monitor():
+    if os.name != 'nt':
+        raise RuntimeError("Screenshot commands require Windows")
+    from windows_runtime import session_locked
+    from remote_commands import CaptureUnavailable
+    if session_locked():
+        raise CaptureUnavailable("Windows sedang terkunci pada desktop aman; screenshot tidak tersedia.")
+    from mss import MSS
+    from screenshot_codec import encode_screenshot
+    with MSS() as capture:
+        # MSS monitor ordering is positional; find the display containing the desktop origin.
+        monitor = next((m for m in capture.monitors[1:] if m["left"] == 0 and m["top"] == 0), capture.monitors[1])
+        if monitor["width"] > 8192 or monitor["height"] > 8192 or monitor["width"] * monitor["height"] > 16_000_000:
+            raise RuntimeError("Monitor exceeds screenshot pixel limit")
+        shot = capture.grab(monitor)
+        return encode_screenshot(shot.rgb, shot.size, config.get("screenshot_jpeg_quality", 80))
+
+
+def commit_remote_shutdown(version, token):
+    with STATE_LOCK:
+        current = command_guard()
+        if current[1:] != token[1:] or current[0] not in (token[0], version):
+            raise RuntimeError("Local staff changed PC control during shutdown authorization")
+        local_state.update(control_version=version, is_locked=True, from_when=None, duration=None,
+                           expires_at=None, session_id=None, applied_control_version=None,
+                           attempted_control_version=None, control_error=None)
+        SESSION_CLOCK.clear()
+    if not save_state():
+        raise RuntimeError("Cannot save next-startup lock state")
+
+
+def submit_windows_shutdown():
+    if os.name != 'nt':
+        raise RuntimeError("Shutdown commands require Windows")
+    executable = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "shutdown.exe")
+    result = subprocess.run([executable, "/s", "/t", "0", "/d", "p:0:0"],
+                            capture_output=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode != 0:
+        raise RuntimeError("Windows rejected shutdown")
+
+
+def show_shutdown_notice(seconds):
+    def show():
+        if not COMMAND_MANAGER or not COMMAND_MANAGER.busy.is_set():
+            return
+        window = tk.Toplevel(root)
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        window.configure(bg="#7c2d12")
+        window.geometry(f"520x110+{max(0, (root.winfo_screenwidth()-520)//2)}+30")
+        label = tk.Label(window, bg="#7c2d12", fg="white", font=("Segoe UI", 14, "bold"), wraplength=490)
+        label.pack(fill="both", expand=True, padx=15, pady=12)
+        deadline = time.monotonic() + seconds
+        def tick():
+            if not COMMAND_MANAGER.busy.is_set():
+                window.destroy()
+                return
+            left = max(0, int(deadline - time.monotonic()))
+            label.config(text=f"PC akan dimatikan oleh petugas dalam {left} detik.\nSegera simpan pekerjaan Anda.")
+            window.after(250, tick)
+        tick()
+    enqueue_gui(show)
+
+
+def initialize_remote_commands():
+    global COMMAND_MANAGER
+    from remote_commands import CommandReceipts, RemoteCommands
+    try:
+        receipts = CommandReceipts(os.path.join(os.path.dirname(config_path), "command-receipts.json"))
+        COMMAND_MANAGER = RemoteCommands(BOOT_ID, receipts, report_remote_command,
+            upload_remote_screenshot, capture_primary_monitor, submit_windows_shutdown,
+            command_guard, show_shutdown_notice, commit_remote_shutdown, HOST_ACTION_LOCK)
+        threading.Thread(target=COMMAND_MANAGER.run, daemon=True).start()
+    except Exception as error:
+        logging.error("Remote commands disabled until receipt cache is repaired (%s).", type(error).__name__)
+        COMMAND_MANAGER = None
+
+
 def update_allowed():
     with STATE_LOCK:
         with gui_lock:
             return (local_state["is_locked"] and is_locked and not lock_health_error
-                    and SESSION_CLOCK.remaining() is None and not local_state["pending_actions"])
+                    and SESSION_CLOCK.remaining() is None and not local_state["pending_actions"]
+                    and not (COMMAND_MANAGER and COMMAND_MANAGER.busy.is_set()))
 
 
 def install_release(staged, tag, digest):
     from pathlib import Path
     from windows_runtime import lock_for_update
     from updater import installer_script
-    with STATE_LOCK:
-        if not update_allowed():
-            return
-        directory = Path(config_path).parent
-        marker = directory / ("update-health-" + uuid.uuid4().hex + ".ready")
-        helper = directory / "update-install.ps1"
-        helper.write_text(installer_script(sys.executable, staged, marker, os.getpid(), digest, tag), encoding="utf-8-sig")
-        # Native Windows lock keeps the desktop protected while the Tk process restarts.
-        if not lock_for_update():
-            raise RuntimeError("Windows could not lock the workstation for update")
-        subprocess.Popen(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                          "-File", str(helper)], creationflags=subprocess.CREATE_NO_WINDOW)
-        logging.info("Installing verified update %s; previous executable retained for rollback.", tag)
-        logging.shutdown()
-        os._exit(0)
+    if not HOST_ACTION_LOCK.acquire(blocking=False):
+        return
+    try:
+        with STATE_LOCK:
+            if not update_allowed():
+                return
+            directory = Path(config_path).parent
+            marker = directory / ("update-health-" + uuid.uuid4().hex + ".ready")
+            helper = directory / "update-install.ps1"
+            helper.write_text(installer_script(sys.executable, staged, marker, os.getpid(), digest, tag), encoding="utf-8-sig")
+            # Native Windows lock keeps the desktop protected while the Tk process restarts.
+            if not lock_for_update():
+                raise RuntimeError("Windows could not lock the workstation for update")
+            subprocess.Popen(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                              "-File", str(helper)], creationflags=subprocess.CREATE_NO_WINDOW)
+            logging.info("Installing verified update %s; previous executable retained for rollback.", tag)
+            logging.shutdown()
+            os._exit(0)
+
+    finally:
+        HOST_ACTION_LOCK.release()
 
 
 
@@ -1296,6 +1453,8 @@ if __name__ == "__main__":
     # Run the background blacklist process checker
     watcher_thread = threading.Thread(target=blacklist_watcher, daemon=True)
     watcher_thread.start()
+
+    initialize_remote_commands()
 
     # Run the client status heartbeat loop (replacing the old push Flask API server)
     heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)

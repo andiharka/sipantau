@@ -33,7 +33,7 @@ jobs:
         run: |
           python -c 'import os,re; tag=os.environ["RELEASE_TAG"]; assert re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag); open("version.py", "w").write("VERSION = " + repr(tag[1:]) + "\n")'
 
-      - name: Test agent protocol and countdown
+      - name: Test protocol, offline controls, remote commands and updater
         run: python -m unittest discover -s tests -v
 
       - name: Install PyInstaller
@@ -53,6 +53,7 @@ jobs:
             "server_url": "http://[IP_ADDRESS]",
             "master_password": "",
             "verify_ssl": true,
+            "screenshot_jpeg_quality": 80,
             "auto_update": false,
             "autorun": false,
             "auto_lock_on_run": false,
