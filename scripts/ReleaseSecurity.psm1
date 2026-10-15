@@ -1,8 +1,19 @@
 Set-StrictMode -Version Latest
 
 function Get-DefenderInfo {
-    Import-Module Defender -ErrorAction Stop
-    return Get-MpComputerStatus -ErrorAction Stop
+    # Query the documented native CIM provider directly. Importing Defender in pwsh
+    # otherwise creates a WinPS compatibility session on hosted Windows runners.
+    return Get-CimInstance -Namespace 'root/Microsoft/Windows/Defender' -ClassName 'MSFT_MpComputerStatus' -ErrorAction Stop
+}
+
+function Get-DefenderSnapshot($Status) {
+    $snapshot = [ordered]@{}
+    foreach ($name in @('AMServiceEnabled', 'AntivirusEnabled', 'RealTimeProtectionEnabled', 'AMRunningMode',
+                         'AntivirusSignatureVersion', 'AMEngineVersion')) {
+        $property = $Status.PSObject.Properties[$name]
+        $snapshot[$name] = if ($null -ne $property) { $property.Value } else { $null }
+    }
+    return $snapshot
 }
 
 function Find-DefenderCli {
@@ -71,25 +82,37 @@ function Test-ReleasePath {
     [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($reportFile)) | Out-Null
     $report = [ordered]@{ outcome = 'blocked'; started_at = [DateTime]::UtcNow.ToString('o');
         finished_at = $null; path = $fullPath; signature_version = $null; engine_version = $null;
+        scan_policy = 'on-demand'; defender_before = $null; defender_after_update = $null;
         scan_exit_code = $null; error = $null; files = @() }
     try {
         $before = @(Get-ArtifactInventory $fullPath)
         $report.files = $before
         $status = Get-DefenderInfo
-        if (!$status.AntivirusEnabled -or !$status.AMServiceEnabled -or !$status.RealTimeProtectionEnabled) {
-            throw 'Microsoft Defender must be active, including real-time protection; publishing is blocked.'
+        $report.defender_before = Get-DefenderSnapshot $status
+        # Hosted runner images disable real-time monitoring. This is separate from
+        # the custom scanner's ability to examine every file and report detections.
+        if ($status.RealTimeProtectionEnabled -ne $true) {
+            Write-Warning 'Real-time protection is off on this runner. Publication still requires a successful on-demand scan.'
         }
         $cli = Find-DefenderCli
+        # Assess service and engine readiness after the native signature update.
         $updateCode = Invoke-DefenderCommand $cli @('-SignatureUpdate') ($reportFile + '.signature.log')
         if ($updateCode -ne 0) { throw "Defender security intelligence update failed (exit $updateCode)." }
         $status = Get-DefenderInfo
-        if ([string]::IsNullOrWhiteSpace($status.AntivirusSignatureVersion)) {
-            throw 'Defender security intelligence version is unavailable; publishing is blocked.'
-        }
+        $report.defender_after_update = Get-DefenderSnapshot $status
         $report.signature_version = $status.AntivirusSignatureVersion
         $report.engine_version = $status.AMEngineVersion
+        if ($status.AMServiceEnabled -ne $true) {
+            throw 'Microsoft Defender service is not running after signature update; an on-demand scan cannot be verified. See defender_after_update in the scan report.'
+        }
+        if ([string]::IsNullOrWhiteSpace($status.AntivirusSignatureVersion) -or $status.AntivirusSignatureVersion -eq '0.0.0.0') {
+            throw 'Defender security intelligence version is unavailable; publishing is blocked.'
+        }
+        if ([string]::IsNullOrWhiteSpace($status.AMEngineVersion) -or $status.AMEngineVersion -eq '0.0.0.0') {
+            throw 'Defender scan engine version is unavailable; publishing is blocked.'
+        }
         # DisableRemediation applies ONLY to this custom scan: inspect without modifying the artifact.
-        # Real-time protection remains enabled. Any detection/error blocks publication.
+        # This does not alter real-time protection settings. Any detection/error blocks publication.
         $code = Invoke-DefenderCommand $cli @('-Scan', '-ScanType', '3', '-File', $fullPath, '-DisableRemediation') ($reportFile + '.scan.log')
         $report.scan_exit_code = $code
         if ($code -ne 0) { throw "Defender detected a threat or could not finish the scan (exit $code)." }
