@@ -10,19 +10,23 @@ import subprocess
 import sys
 import zipfile
 
+# Direct script execution puts scripts/, rather than the project root, on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from app_identity import APP_NAME, EXECUTABLE_STEM, EXECUTABLE_NAME, PORTABLE_NAME
+
 DEFAULT_CONFIG = {
     'api_key': 'SET_A_GENERATED_KEY_OF_AT_LEAST_32_CHARACTERS',
     'server_url': 'http://[IP_ADDRESS]', 'master_password': '', 'verify_ssl': True,
     'screenshot_jpeg_quality': 80, 'auto_update': False, 'autorun': False,
     'auto_lock_on_run': False, 'hostname': 'PC-00',
 }
-INSTALL_NOTES = '''Folder package — keep SIPANTAU.exe and _internal together.
+INSTALL_NOTES = f'''Folder package — keep {EXECUTABLE_NAME} and _internal together.
 
 Extract into a new folder with administrator-controlled write permissions.
 For an upgrade, stop the old agent and back up its directory first. Copy your
 existing config.json and state.json into this new folder; do not overwrite them
 with the template. Configure server_url, api_key and a private master_password
-before starting a new installation. Start SIPANTAU.exe with administrator access.
+before starting a new installation. Start {EXECUTABLE_NAME} with administrator access.
 
 The folder package supports manual update checks. Install its updates as a complete
 folder; executable-only automatic replacement is disabled for this package.
@@ -45,11 +49,11 @@ def version_resource(tag):
                    flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
   kids=[StringFileInfo([StringTable('040904B0', [
     StringStruct('CompanyName', 'SIPANTAU project'),
-    StringStruct('FileDescription', 'Computer lab management client'),
+    StringStruct('FileDescription', {APP_NAME!r}),
     StringStruct('FileVersion', {tag[1:]!r}),
     StringStruct('ProductVersion', {tag[1:]!r}),
-    StringStruct('ProductName', 'SIPANTAU'),
-    StringStruct('OriginalFilename', 'SIPANTAU.exe')
+    StringStruct('ProductName', {APP_NAME!r}),
+    StringStruct('OriginalFilename', {EXECUTABLE_NAME!r})
   ])]), VarFileInfo([VarStruct('Translation', [1033, 1200])])]
 )
 '''
@@ -76,13 +80,14 @@ def build(root, tag, package_format, run=subprocess.run):
         version_path.write_text(f'VERSION = {tag[1:]!r}\nBUILD_FORMAT = {package_format!r}\n', encoding='utf-8')
         clear_version_cache()
         run([sys.executable, '-m', 'PyInstaller', '--' + package_format, '--noconsole', '--uac-admin',
-             '--noupx', '--clean', '--noconfirm', '--name', 'SIPANTAU', '--version-file', str(resource),
+             '--noupx', '--clean', '--noconfirm', '--name', EXECUTABLE_STEM, '--version-file', str(resource),
+             '--icon', str(root/'assets'/'app.ico'), '--add-data', str(root/'assets') + os.pathsep + 'assets',
              '--distpath', str(output), '--workpath', str(work), '--specpath', str(work),
              str(root/'agent.py')], cwd=root, check=True)
     finally:
         version_path.write_bytes(original)
         clear_version_cache()
-    executable = output/'SIPANTAU'/'SIPANTAU.exe' if package_format == 'onedir' else output/'SIPANTAU.exe'
+    executable = output/EXECUTABLE_STEM/EXECUTABLE_NAME if package_format == 'onedir' else output/EXECUTABLE_NAME
     if not executable.is_file():
         raise RuntimeError('Build did not leave an executable; inspect the build and antivirus logs')
     if package_format == 'onedir':
@@ -93,11 +98,13 @@ def build(root, tag, package_format, run=subprocess.run):
 
 def archive_folder(root):
     root = Path(root).resolve()
-    folder = root/'dist'/'onedir'/'SIPANTAU'
-    if not (folder/'SIPANTAU.exe').is_file() or not (folder/'_internal').is_dir():
+    folder = root/'dist'/'onedir'/EXECUTABLE_STEM
+    if not (folder/EXECUTABLE_NAME).is_file() or not (folder/'_internal').is_dir():
         raise RuntimeError('Incomplete folder package')
-    destination = root/'release'/'SIPANTAU-portable.zip'
+    destination = root/'release'/PORTABLE_NAME
     destination.parent.mkdir(parents=True, exist_ok=True)
+    # Publish a separate template for single-file installations, without private settings.
+    (destination.parent/'config.json').write_text(json.dumps(DEFAULT_CONFIG, indent=2) + '\n', encoding='utf-8')
     with zipfile.ZipFile(destination, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
         for file in sorted(folder.rglob('*')):
             if file.is_symlink():

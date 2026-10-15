@@ -154,3 +154,29 @@ class UpdaterTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     updater.check_for_update('1.0.0')
                 asset['digest'] = 'sha256:' + 'a'*64
+
+
+    def test_renamed_assets_are_preferred_with_legacy_fallback_and_strict_validation(self):
+        legacy = release()
+        renamed = release()
+        renamed['assets'][0]['name'] = 'SystemObservation.exe'
+        renamed['assets'][0]['browser_download_url'] = renamed['assets'][0]['browser_download_url'].replace('SIPANTAU.exe', 'SystemObservation.exe')
+        combined = {**renamed, 'assets': renamed['assets'] + legacy['assets']}
+        client = mock.Mock()
+        client.get.return_value.json.return_value = combined
+        self.assertEqual(updater.fetch_update(client, '1.0.0')[1]['name'], 'SystemObservation.exe')
+        client.get.return_value.json.return_value = legacy
+        self.assertEqual(updater.fetch_update(client, '1.0.0')[1]['name'], 'SIPANTAU.exe')
+        with mock.patch.object(updater.requests, 'Session') as session:
+            session.return_value.__enter__.return_value.get.return_value.json.return_value = combined
+            self.assertEqual(updater.check_for_update('1.0.0')[1]['name'], 'SystemObservation.exe')
+            portable = {**renamed['assets'][0], 'name': 'SystemObservation-portable.zip'}
+            portable['browser_download_url'] = portable['browser_download_url'].replace('SystemObservation.exe', portable['name'])
+            combined['assets'].append(portable)
+            with mock.patch.object(updater, 'BUILD_FORMAT', 'onedir'):
+                self.assertEqual(updater.check_for_update('1.0.0')[1]['name'], portable['name'])
+            renamed['assets'][0]['digest'] = ''
+            # An invalid preferred asset cannot silently fall back to another download.
+            client.get.return_value.json.return_value = combined
+            with self.assertRaises(ValueError):
+                updater.fetch_update(client, '1.0.0')

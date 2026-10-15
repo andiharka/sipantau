@@ -15,6 +15,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from client_logging import NetworkLog
 from version import VERSION, BUILD_FORMAT
+from app_identity import APP_NAME, PORTABLE_ASSETS, apply_window_identity
 import subprocess
 import tkinter as tk
 from tkinter import messagebox
@@ -542,7 +543,7 @@ def show_configuration_viewer(window):
         return
     dialog = tk.Toplevel(window)
     window._settings_dialog = dialog
-    dialog.title("Konfigurasi komputer")
+    apply_window_identity(dialog, "Konfigurasi komputer")
     dialog.configure(bg=UI_PANEL)
     dialog.transient(window)
     dialog.attributes("-topmost", True)
@@ -613,7 +614,7 @@ def show_configuration_viewer(window):
                 selected = check_for_update(VERSION)
                 if selected:
                     text = f"Pembaruan tersedia: {selected[0]}. Versi saat ini: v{VERSION}."
-                    if selected[1].get("name") == "SIPANTAU-portable.zip":
+                    if selected[1].get("name") in PORTABLE_ASSETS:
                         text += " Unduh paket folder lengkap dan pasang secara manual."
                 else:
                     text = f"Versi v{VERSION} sudah yang terbaru."
@@ -676,6 +677,7 @@ def show_lock_screen_gui():
         hide_lock_screen_gui()
 
     window = tk.Toplevel(root)
+    apply_window_identity(window)
     lock_window = window
     window._closing = False
     window._regrab_job = None
@@ -932,6 +934,7 @@ def rearrange_notifications():
 def trigger_kill_notification(exe_name):
     # Create borderless, topmost window
     noti = tk.Toplevel(root)
+    apply_window_identity(noti)
     noti.overrideredirect(True)
     noti.attributes("-topmost", True)
     
@@ -1090,6 +1093,7 @@ def show_timer_window_gui():
     if timer_window is not None:
         return
     window = tk.Toplevel(root)
+    apply_window_identity(window)
     timer_window = window
     window.configure(bg=UI_PANEL)
     window.overrideredirect(True)
@@ -1531,6 +1535,7 @@ def show_shutdown_notice(seconds):
         if not COMMAND_MANAGER or not COMMAND_MANAGER.busy.is_set():
             return
         window = tk.Toplevel(root)
+        apply_window_identity(window)
         window.overrideredirect(True)
         window.attributes("-topmost", True)
         window.configure(bg="#7c2d12")
@@ -1622,6 +1627,7 @@ if __name__ == "__main__":
             sys.exit(0)
     # A real Tk parent makes startup warnings visible even for --noconsole releases.
     root = tk.Tk()
+    apply_window_identity(root)
     root.withdraw()
     if not startup_config_ready(root):
         root.destroy()
@@ -1667,7 +1673,7 @@ if __name__ == "__main__":
                                      enqueue_gui, update_allowed, install_release)
     threading.Thread(target=release_updater.run, daemon=True).start()
     root.after(1000, report_update_ready)
-    logging.info("SIPANTAU %s started; auto-update enabled: %s", VERSION, release_updater.enabled)
+    logging.info("%s %s started; auto-update enabled: %s", APP_NAME, VERSION, release_updater.enabled)
 
     # Start periodic GUI timer updates
     root.after(1000, update_timer_gui)

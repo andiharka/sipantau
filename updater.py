@@ -15,6 +15,7 @@ import time
 import uuid
 import requests
 from version import BUILD_FORMAT
+from app_identity import EXECUTABLE_ASSETS, PORTABLE_ASSETS, EXECUTABLE_STEM
 
 REPOSITORY = 'andiharka/sipantau'
 MAX_DOWNLOAD = 128 * 1024 * 1024
@@ -32,7 +33,7 @@ def select_asset(release, current, asset_name='SIPANTAU.exe'):
     tag = release.get('tag_name')
     if version_tuple(tag) <= version_tuple(current):
         return None
-    if asset_name not in ('SIPANTAU.exe', 'SIPANTAU-portable.zip'):
+    if asset_name not in EXECUTABLE_ASSETS + PORTABLE_ASSETS:
         raise ValueError('Unexpected release asset name')
     assets = [a for a in release.get('assets', []) if a.get('name') == asset_name]
     if len(assets) != 1:
@@ -65,9 +66,10 @@ def fetch_update(session, current_version):
     if version_tuple(data.get('tag_name')) <= version_tuple(current_version):
         return None
     # Folder-only releases deliberately omit the legacy executable if it failed scanning.
-    if not any(asset.get('name') == 'SIPANTAU.exe' for asset in data.get('assets', [])):
-        return None
-    return select_asset(data, current_version)
+    for name in EXECUTABLE_ASSETS:
+        if any(asset.get('name') == name for asset in data.get('assets', [])):
+            return select_asset(data, current_version, name)
+    return None
 
 
 def check_for_update(current_version):
@@ -77,7 +79,7 @@ def check_for_update(current_version):
         data = fetch_release(session)
         if version_tuple(data.get('tag_name')) <= version_tuple(current_version):
             return None
-        preferred = ('SIPANTAU-portable.zip', 'SIPANTAU.exe') if BUILD_FORMAT == 'onedir' else ('SIPANTAU.exe', 'SIPANTAU-portable.zip')
+        preferred = PORTABLE_ASSETS + EXECUTABLE_ASSETS if BUILD_FORMAT == 'onedir' else EXECUTABLE_ASSETS + PORTABLE_ASSETS
         for name in preferred:
             if any(asset.get('name') == name for asset in data.get('assets', [])):
                 return select_asset(data, current_version, name)
@@ -288,7 +290,7 @@ class ReleaseUpdater:
                         return
                 except (ValueError, OSError):
                     pass
-            staged = self.directory / 'SIPANTAU.update.exe'
+            staged = self.directory / (EXECUTABLE_STEM + '.update.exe')
             download_asset(session, asset, staged)
         self.in_progress = True
         def apply():

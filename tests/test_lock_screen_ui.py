@@ -63,7 +63,8 @@ class Widget:
     def attributes(self, *args): pass
     def overrideredirect(self, value): pass
     def protocol(self, *args): pass
-    def title(self, value): pass
+    def title(self, value): self.props["title"] = value
+    def iconbitmap(self, value): self.props["icon"] = value
     def transient(self, parent): pass
     def resizable(self, *args): pass
     def geometry(self, value): self.placement = value

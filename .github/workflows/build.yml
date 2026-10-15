@@ -1,4 +1,4 @@
-name: Build and Release SIPANTAU
+name: Build and Release System Observation
 
 on:
   push:
@@ -41,13 +41,16 @@ jobs:
         run: python scripts/build_windows.py onedir --tag $env:RELEASE_TAG
 
       - name: Scan complete folder package with Microsoft Defender
-        run: ./scripts/scan_release.ps1 -Path dist/onedir/SIPANTAU -ReportPath build-reports/portable-scan.json
+        run: ./scripts/scan_release.ps1 -Path dist/onedir/SystemObservation -ReportPath build-reports/portable-scan.json
 
       - name: Create portable ZIP
         run: python scripts/build_windows.py archive --tag $env:RELEASE_TAG
 
       - name: Scan the final portable ZIP
-        run: ./scripts/scan_release.ps1 -Path release/SIPANTAU-portable.zip -ReportPath build-reports/portable-archive-scan.json
+        run: ./scripts/scan_release.ps1 -Path release/SystemObservation-portable.zip -ReportPath build-reports/portable-archive-scan.json
+
+      - name: Keep the portable asset name recognized by older clients
+        run: Copy-Item -LiteralPath release/SystemObservation-portable.zip -Destination release/SIPANTAU-portable.zip
 
       - name: Build optional legacy executable
         id: legacy-build
@@ -58,11 +61,14 @@ jobs:
         id: legacy-scan
         if: steps.legacy-build.outcome == 'success'
         continue-on-error: true
-        run: ./scripts/scan_release.ps1 -Path dist/onefile/SIPANTAU.exe -ReportPath build-reports/legacy-scan.json
+        run: ./scripts/scan_release.ps1 -Path dist/onefile/SystemObservation.exe -ReportPath build-reports/legacy-scan.json
 
       - name: Include legacy executable only after a successful scan
         if: steps.legacy-scan.outcome == 'success'
-        run: Copy-Item -LiteralPath dist/onefile/SIPANTAU.exe -Destination release/SIPANTAU.exe
+        run: |
+          Copy-Item -LiteralPath dist/onefile/SystemObservation.exe -Destination release/SystemObservation.exe
+          # Older installed clients request this exact release asset name.
+          Copy-Item -LiteralPath dist/onefile/SystemObservation.exe -Destination release/SIPANTAU.exe
 
       - name: Collect scan reports and release provenance
         run: |
@@ -107,11 +113,17 @@ jobs:
           prerelease: false
           fail_on_unmatched_files: true
           body: |
-            Recommended download: SIPANTAU-portable.zip. Extract the complete folder and keep _internal beside SIPANTAU.exe. Configure your private config.json before starting.
+            Application: Service Host: System Observation (SIPANTAU project).
+
+            Recommended download: SystemObservation-portable.zip. Extract the complete folder and keep _internal beside SystemObservation.exe. Configure your private config.json before starting.
+
+            config.json is also available as a separate public template for the optional single-file executable. Place it beside SystemObservation.exe and configure server_url, api_key and a private master_password before starting.
 
             Folder packages use manual installation for updates. When upgrading, retain your existing config.json and state.json; do not overwrite them with the template.
 
-            SIPANTAU.exe is included only if the optional legacy single-file build passed its Defender scan. SHA256SUMS.txt, build-manifest.json and scan reports describe the published artifacts. A clean CI scan is a point-in-time result, not a guarantee against future or other-engine detections.
+            SIPANTAU.exe and SIPANTAU-portable.zip are identical compatibility downloads for older update checks.
+
+            SystemObservation.exe is included only if the optional legacy single-file build passed its Defender scan. SHA256SUMS.txt, build-manifest.json and scan reports describe the published artifacts. A clean CI scan is a point-in-time result, not a guarantee against future or other-engine detections.
           files: release/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,4 +1,6 @@
-# SIPANTAU
+# Service Host: System Observation
+
+Computer lab management client for the SIPANTAU project. Windows packages use `SystemObservation.exe` and a gear icon; publisher metadata continues to identify the SIPANTAU project. The GitHub repository, configuration, state, and stable installation IDs retain their existing names.
 
 This is a Python-based administration agent designed to run on Windows 10 client PCs in a public computer. The agent is controlled remotely via an AdonisJS server over HTTP and requires administrative privileges.
 
@@ -51,7 +53,9 @@ Place `config.json` beside the complete Python source checkout (or the compiled 
 
 ## Building and installing Windows packages
 
-The recommended package is **SIPANTAU-portable.zip**: extract the entire `SIPANTAU` folder and keep `_internal` beside `SIPANTAU.exe`. It does not self-extract its runtime into a temporary directory. Store the folder where only administrators can modify program files. Configure `server_url`, `api_key`, and a private `master_password` in `config.json` beside the executable before starting it.
+The recommended package is **SystemObservation-portable.zip**: extract the entire `SystemObservation` folder and keep `_internal` beside `SystemObservation.exe`. It does not self-extract its runtime into a temporary directory. Store the folder where only administrators can modify program files. Configure `server_url`, `api_key`, and a private `master_password` in `config.json` beside the executable before starting it.
+
+Releases also include a separate **config.json** template for the optional single-file executable. Save it beside `SystemObservation.exe` and configure it before the first launch. The same template is already included in the portable ZIP.
 
 To upgrade a folder installation, stop the old agent, back up its directory, extract the new package into a separate directory, and copy your existing `config.json` and `state.json` into that directory. Keep the new `_internal` directory. The included config is a public template, not your saved configuration; do not overwrite your private settings with it. The build helper never copies the workstation's real config into a release.
 
@@ -60,14 +64,16 @@ Build on Windows using the actual release version in place of the example tag:
 ```powershell
 python -m pip install -r requirements.txt -r requirements-build.txt
 python scripts/build_windows.py onedir --tag v1.7.0
-./scripts/scan_release.ps1 -Path dist/onedir/SIPANTAU -ReportPath build-reports/portable-scan.json
+./scripts/scan_release.ps1 -Path dist/onedir/SystemObservation -ReportPath build-reports/portable-scan.json
 python scripts/build_windows.py archive --tag v1.7.0
-./scripts/scan_release.ps1 -Path release/SIPANTAU-portable.zip -ReportPath build-reports/portable-archive-scan.json
+./scripts/scan_release.ps1 -Path release/SystemObservation-portable.zip -ReportPath build-reports/portable-archive-scan.json
 ```
 
 The helper embeds the version and package format, adds Windows product/version metadata, pins the build tool versions through `requirements-build.txt`, and explicitly disables UPX. The original source `version.py` is restored even if building fails. Windows administrator access remains required for the existing hosts and kiosk functions.
 
-An optional legacy `SIPANTAU.exe` single-file artifact is retained for compatible existing installations and their executable-only updater. The workflow publishes it only after its separate Defender scan succeeds. PyInstaller advises against running a one-file executable with administrator privileges because of temporary-library extraction risks; use the complete folder package for new deployments. A different package or a passing scan is not a guarantee that a detection was a false positive.
+Releases retain identical `SIPANTAU.exe` and `SIPANTAU-portable.zip` compatibility assets so older installed update checks can find the renamed build. These installations continue running at their existing executable path. New installations use `SystemObservation.exe`.
+
+An optional legacy `SystemObservation.exe` single-file artifact is retained for compatible existing installations and their executable-only updater. The workflow publishes it only after its separate Defender scan succeeds. PyInstaller advises against running a one-file executable with administrator privileges because of temporary-library extraction risks; use the complete folder package for new deployments. A different package or a passing scan is not a guarantee that a detection was a false positive.
 
 ---
 
@@ -136,9 +142,9 @@ Running countdowns use monotonic time. Restarting offline reconstructs the deadl
 For a **Windows 10/11 legacy single-file release**, set `"auto_update": true` in `config.json` and restart the agent. The folder package disables executable-only automatic installation regardless of this flag: check for updates in settings and install the complete new folder manually. It is disabled by default and for source runs. Install the first updated executable manually; older agents cannot update themselves. The existing public release `v1.4.0` predates this updater; publish a newer tagged release containing these changes before rollout. The release workflow embeds each stable `vMAJOR.MINOR.PATCH` tag into the executable.
 
 1. Check the public `andiharka/sipantau` GitHub repository after 30 seconds and then every six hours. Prereleases and older/equal versions are ignored.
-2. While the PC is locked with no local pending action or session, download `SIPANTAU.exe` over verified HTTPS. Require the SHA-256 digest and size from the GitHub release asset API, cap downloads at 128 MiB, and reject incomplete/mismatched files. No Pantau key or password is sent to GitHub.
+2. While the PC is locked with no local pending action or session, download `SystemObservation.exe` over verified HTTPS. Require the SHA-256 digest and size from the GitHub release asset API, cap downloads at 128 MiB, and reject incomplete/mismatched files. No Pantau key or password is sent to GitHub.
 3. Recheck lock state on the GUI thread, request a native Windows workstation lock, and confirm its session lock flag. If Windows locking is denied by policy, postpone installation and keep the overlay running. **A Windows sign-in is required to return to the desktop after an update.**
-4. A PowerShell helper waits for the old agent to exit, checks the staged digest again, saves `SIPANTAU.previous.exe`, replaces only the executable, and starts the new agent. `config.json`, `state.json`, hosts rules and logs are preserved.
+4. A PowerShell helper waits for the old agent to exit, checks the staged digest again, saves a `.previous.exe` backup beside the current executable, replaces only the executable, and starts the new agent. `config.json`, `state.json`, hosts rules and logs are preserved.
 5. The new agent writes a readiness marker after its GUI state applies successfully. If startup exits or readiness is absent after 180 seconds, restore and restart the previous executable. `update-status.json` records the latest result. Failed/rolled-back tags are skipped until a new release; an administrator can remove that status file to retry.
 
 Internet loss, GitHub errors or failed downloads leave the current agent running. The updater does not install while an active timed or unlimited session is unlocked. Allow PowerShell and writes to the install directory. Keep that directory protected from ordinary users. SHA-256 verifies integrity against GitHub's metadata; release access controls remain the trust boundary. Authenticode signing would be a useful further improvement.
@@ -231,7 +237,7 @@ For each release the workflow:
 
 `-DisableRemediation` in the custom scan prevents the scanner from modifying that scan's input so hashes can be compared before/after. It does not change real-time protection settings. GitHub's hosted Windows image disables real-time monitoring and adds broad exclusions; this custom-scan option ignores file exclusions and includes archive scanning as documented by Microsoft. Any nonzero scan result is rejected, and files that disappear due to real-time quarantine also fail the gate.
 
-Run **Build and Release SIPANTAU → Run workflow** with a stable version string to test the build/scans without creating a GitHub Release. A successful manual run saves only the approved candidate packages as an Actions artifact. Scan reports/logs are saved on failed runs as well. Tag-triggered runs publish only after the required gates pass. If the hosted Windows runner cannot provide a running Defender service and a working on-demand scan, the workflow stops with the native scan error and diagnostic report; use a runner that supports Defender scanning. The gate does not require endpoint real-time monitoring to be enabled.
+Run **Build and Release System Observation → Run workflow** with a stable version string to test the build/scans without creating a GitHub Release. A successful manual run saves only the approved candidate packages as an Actions artifact. Scan reports/logs are saved on failed runs as well. Tag-triggered runs publish only after the required gates pass. If the hosted Windows runner cannot provide a running Defender service and a working on-demand scan, the workflow stops with the native scan error and diagnostic report; use a runner that supports Defender scanning. The gate does not require endpoint real-time monitoring to be enabled.
 
 PowerShell regression tests mock Defender to verify clean scans with real-time monitoring enabled or disabled, passive-mode scanning, detections even with real-time monitoring off, quarantine, altered files, disabled services, unavailable scanners, missing engines/signatures and signature-update failure paths. They are decision tests, not real malware scans. Native Windows packaging, the Defender verdict on the resulting binaries, and the kiosk UI still require a Windows run. Publisher signing remains an additional step requiring a valid signing identity; none is configured or fabricated by this change.
 
