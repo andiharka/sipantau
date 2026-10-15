@@ -8,6 +8,8 @@ import socket
 import threading
 import queue
 import re
+import math
+from client_config import ConfigurationError, read_config, configuration_summary
 from control_runtime import SessionClock, utc
 import logging
 from logging.handlers import RotatingFileHandler
@@ -22,27 +24,25 @@ import urllib3
 import psutil
 
 # 1. Config Loader
+CONFIG_ERROR = None
+CONFIG_LOADED_AT = None
+
+
 def load_config():
-    if getattr(sys, 'frozen', False):
-        # Running as compiled exe
-        dir_path = os.path.dirname(sys.executable)
-    else:
-        # Running as script
-        dir_path = os.path.dirname(os.path.abspath(__file__))
-    
-    config_path = os.path.join(dir_path, "config.json")
+    global CONFIG_ERROR, CONFIG_LOADED_AT
+    directory = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
+    path = os.path.join(directory, "config.json")
+    CONFIG_ERROR = None
+    CONFIG_LOADED_AT = None
     try:
-        with open(config_path, "r") as f:
-            config_data = json.load(f)
-            return config_data, config_path
-    except Exception as e:
-        # Default fallback config if file missing
-        fallback = {
-            "api_key": "",
-            "server_url": "",
-            "master_password": None,
-        }
-        return fallback, config_path
+        data = read_config(path)
+        CONFIG_LOADED_AT = datetime.now().astimezone().strftime("%d/%m/%Y %H:%M:%S %Z")
+        return data, path
+    except ConfigurationError as error:
+        CONFIG_ERROR = str(error)
+        # Retained only for safe imports; startup displays a warning and exits before locking.
+        return {"api_key": "", "server_url": "", "master_password": None}, path
+
 
 config, config_path = load_config()
 state_path = os.path.join(os.path.dirname(config_path), "state.json")
@@ -64,6 +64,7 @@ BOOT_ID = uuid.uuid4().hex
 COMMAND_MANAGER = None
 LOCAL_CONTROL_EPOCH = 0
 HOST_ACTION_LOCK = threading.Lock()
+UPDATE_CHECK_LOCK = threading.Lock()
 
 # 3. Dynamic Hosts Path (NT vs Unix development fallback)
 if os.name == 'nt':
@@ -252,9 +253,10 @@ def process_gui_commands():
 def apply_gui_control(version):
     with STATE_LOCK:
         if version != local_state.get("control_version") or local_state["pending_actions"]:
-            return
+            return False
         before = (local_state.get("applied_control_version"), local_state.get("control_error"))
         local_state["attempted_control_version"] = version
+        applied = False
         try:
             if local_state["is_locked"]:
                 show_lock_screen_gui()
@@ -262,6 +264,7 @@ def apply_gui_control(version):
                 hide_lock_screen_gui()
             local_state["applied_control_version"] = version
             local_state["control_error"] = None
+            applied = True
         except Exception as error:
             local_state["applied_control_version"] = None
             local_state["control_error"] = re.sub(r'[\x00-\x1f\x7f]', ' ', str(error))[:500]
@@ -270,23 +273,33 @@ def apply_gui_control(version):
     if changed:
         save_state()
         heartbeat_event.set()
+    return applied
 
 
 def apply_local_gui(pending_id):
     with STATE_LOCK:
         pending = local_state["pending_actions"]
-        if not pending or pending[0].get("id") != pending_id:
-            return
+        if not pending:
+            # A fast heartbeat can acknowledge the action before this Tk callback runs.
+            # Reconcile current state, including any newer server lock, instead of skipping it.
+            return apply_gui_control(local_state.get("control_version"))
+        if pending[0].get("id") != pending_id:
+            return False
+        applied = False
         try:
             if local_state["is_locked"]:
                 show_lock_screen_gui()
             else:
                 hide_lock_screen_gui()
+            local_state["control_error"] = None
+            applied = True
         except Exception as error:
             local_state["attempted_control_version"] = local_state.get("control_version")
             local_state["control_error"] = re.sub(r'[\x00-\x1f\x7f]', ' ', str(error))[:500]
+            logging.error("Could not apply local control: %s", error)
     save_state()
     heartbeat_event.set()
+    return applied
 
 
 def restore_gui_state():
@@ -488,116 +501,365 @@ def restore_cached_site_policy():
 
 
 # 7. GUI Kiosk Screen Operations (Must be executed on main Tkinter thread)
+UI_BG = "#141c23"
+UI_PANEL = "#1e2a33"
+UI_INPUT = "#273742"
+UI_TEXT = "#eef3f5"
+UI_MUTED = "#a8bbc6"
+UI_ACCENT = "#87cbbb"
+TIMER_PRESETS = ((30, "30 menit"), (60, "1 jam"), (180, "3 jam"))
+
+
+def startup_config_ready(parent):
+    if CONFIG_ERROR:
+        messagebox.showwarning(
+            "Konfigurasi belum siap",
+            CONFIG_ERROR + "\n\nLokasi yang dibaca:\n" + config_path +
+            "\n\nPerbaiki file tersebut, lalu jalankan kembali agen. Komputer belum dikunci oleh proses ini.",
+            parent=parent)
+        try:
+            logging.error("Startup configuration rejected at %s: %s", config_path, CONFIG_ERROR)
+        except OSError:
+            pass  # A read-only directory must not prevent the warning dialog.
+        return False
+    logging.info("Configuration loaded from %s at %s.", config_path, CONFIG_LOADED_AT)
+    return True
+
+
+def draw_password_eye(canvas, visible):
+    canvas.delete("icon")
+    canvas.create_line(9, 18, 16, 12, 24, 12, 31, 18, 24, 24, 16, 24, 9, 18,
+                       smooth=True, fill=UI_MUTED, width=2, tags="icon")
+    canvas.create_oval(17, 15, 23, 21, outline=UI_MUTED, width=2, tags="icon")
+    if visible:
+        canvas.create_line(10, 28, 30, 8, fill=UI_TEXT, width=2, tags="icon")
+
+
+def show_configuration_viewer(window):
+    existing = getattr(window, "_settings_dialog", None)
+    if existing and existing.winfo_exists():
+        existing.lift()
+        return
+    dialog = tk.Toplevel(window)
+    window._settings_dialog = dialog
+    dialog.title("Konfigurasi komputer")
+    dialog.configure(bg=UI_PANEL)
+    dialog.transient(window)
+    dialog.attributes("-topmost", True)
+    dialog.resizable(False, False)
+    width = min(660, window.winfo_screenwidth() - 48)
+    height = min(560, window.winfo_screenheight() - 64)
+    dialog.geometry(f"{width}x{height}+{max(0, (window.winfo_screenwidth() - width) // 2)}+{max(0, (window.winfo_screenheight() - height) // 2)}")
+    body = tk.Frame(dialog, bg=UI_PANEL, padx=24, pady=22)
+    body.pack(fill="both", expand=True)
+    tk.Label(body, text="Konfigurasi aktif", font=("Segoe UI", 18, "bold"),
+             fg=UI_TEXT, bg=UI_PANEL).pack(anchor="w")
+    tk.Label(body, text="Nilai saat proses dimulai. Perubahan file memerlukan mulai ulang.",
+             font=("Segoe UI", 10), fg=UI_MUTED, bg=UI_PANEL,
+             wraplength=width - 52, justify="left").pack(anchor="w", pady=(6, 14))
+    content = tk.Frame(body, bg=UI_PANEL)
+    scrollbar = tk.Scrollbar(content)
+    scrollbar.pack(side="right", fill="y")
+    details = tk.Text(content, bg=UI_BG, fg=UI_TEXT, font=("Consolas", 10),
+                      wrap="word", relief="flat", padx=12, pady=12,
+                      yscrollcommand=scrollbar.set, highlightthickness=1,
+                      highlightbackground=UI_INPUT, insertbackground=UI_TEXT)
+    details.pack(fill="both", expand=True)
+    scrollbar.config(command=details.yview)
+    rows = [("File konfigurasi", config_path), ("Dibaca pada", CONFIG_LOADED_AT or "Tidak diketahui"),
+            ("Versi agen", VERSION), *configuration_summary(config, get_agent_hostname())]
+    details.insert("1.0", "\n\n".join(label + "\n" + str(value) for label, value in rows))
+    details.config(state="disabled")
+
+    def close():
+        try:
+            dialog.grab_release()
+        except tk.TclError:
+            pass
+        dialog.destroy()
+        window._settings_dialog = None
+        if window is lock_window and is_locked and window.winfo_exists():
+            window.grab_set()
+            getattr(window, "_password_entry", window).focus_set()
+
+    # Reserve footer space before the scrollable configuration body.
+    footer = tk.Frame(body, bg=UI_PANEL)
+    footer.pack(side="bottom", fill="x", pady=(14, 0))
+    update_status = tk.Label(footer, text=f"Versi saat ini: v{VERSION}.", font=("Segoe UI", 10),
+                             fg=UI_MUTED, bg=UI_PANEL, wraplength=width - 52, justify="left", anchor="w")
+    update_status.pack(fill="x", pady=(0, 10))
+    actions = tk.Frame(footer, bg=UI_PANEL)
+    actions.pack(fill="x")
+
+    def finish_check(text, color):
+        if (window is not lock_window or window._settings_dialog is not dialog
+                or not dialog.winfo_exists()):
+            return
+        update_status.config(text=text, fg=color)
+        check_button.config(text="Periksa pembaruan", state="normal")
+
+    def check_updates():
+        if not UPDATE_CHECK_LOCK.acquire(blocking=False):
+            update_status.config(text="Pemeriksaan sedang berjalan. Coba lagi sebentar.", fg=UI_MUTED)
+            return
+        check_button.config(text="Memeriksa…", state="disabled")
+        update_status.config(text="Memeriksa rilis terbaru…", fg=UI_MUTED)
+
+        def worker():
+            color = "#e9ba72"
+            try:
+                from updater import check_for_update
+                selected = check_for_update(VERSION)
+                if selected:
+                    text = f"Pembaruan tersedia: {selected[0]}. Versi saat ini: v{VERSION}."
+                else:
+                    text = f"Versi v{VERSION} sudah yang terbaru."
+                color = UI_ACCENT
+            except (requests.Timeout, requests.ConnectionError):
+                text = "Tidak dapat terhubung ke GitHub. Periksa koneksi internet, lalu coba lagi."
+            except requests.HTTPError as error:
+                status = error.response.status_code if error.response is not None else None
+                if status in (403, 429):
+                    text = "GitHub membatasi permintaan. Coba lagi nanti."
+                elif status == 404:
+                    text = "Belum ada rilis publik yang tersedia."
+                else:
+                    text = "GitHub belum dapat diakses. Coba lagi nanti."
+            except ValueError:
+                text = "Informasi rilis terbaru belum dapat diverifikasi. Coba lagi nanti."
+            except Exception as error:
+                logging.warning("Manual update check deferred (%s).", type(error).__name__)
+                text = "Pembaruan belum dapat diperiksa. Coba lagi nanti."
+            finally:
+                UPDATE_CHECK_LOCK.release()
+            # All widget access stays on the Tk thread, including after a dialog closes.
+            enqueue_gui(lambda: finish_check(text, color))
+
+        try:
+            threading.Thread(target=worker, daemon=True, name="ManualUpdateCheck").start()
+        except RuntimeError:
+            UPDATE_CHECK_LOCK.release()
+            finish_check("Pemeriksaan belum dapat dimulai. Coba lagi nanti.", "#e9ba72")
+
+    check_button = tk.Button(actions, text="Periksa pembaruan", command=check_updates,
+                             font=("Segoe UI", 11), bg=UI_INPUT, fg=UI_TEXT,
+                             activebackground="#354b59", activeforeground=UI_TEXT,
+                             relief="flat", padx=16, pady=8)
+    check_button.pack(side="left")
+    tk.Button(actions, text="Tutup", command=close, font=("Segoe UI", 11), bg=UI_INPUT,
+              fg=UI_TEXT, activebackground="#354b59", activeforeground=UI_TEXT,
+              relief="flat", padx=24, pady=8).pack(side="right")
+    content.pack(fill="both", expand=True)
+    dialog.protocol("WM_DELETE_WINDOW", close)
+    dialog.bind("<Escape>", lambda event: close())
+    dialog.grab_set()
+    dialog.focus_set()
+
+
 def show_lock_screen_gui():
     global lock_window, is_locked, lock_health_error
-    with gui_lock:
+    window = lock_window
+    if window is not None and window.winfo_exists():
         if is_locked:
             if lock_health_error:
                 raise RuntimeError(lock_health_error)
+            dialog = getattr(window, "_settings_dialog", None)
+            if dialog and dialog.winfo_exists():
+                dialog.lift()
+            else:
+                window.lift()
             return
+        # Recover an incomplete previous build without leaving an orphan fullscreen window.
+        hide_lock_screen_gui()
+
+    window = tk.Toplevel(root)
+    lock_window = window
+    window._closing = False
+    window._regrab_job = None
+    window._status_job = None
+    window._settings_dialog = None
+    window.configure(bg=UI_BG)
+    window.attributes("-fullscreen", True)
+    window.attributes("-topmost", True)
+    window.overrideredirect(True)
+    window.protocol("WM_DELETE_WINDOW", lambda: "break")
     keyboard_error = None
-
-    lock_window = tk.Toplevel(root)
-    lock_window.configure(bg="black")
-    lock_window.attributes("-fullscreen", True)
-    lock_window.attributes("-topmost", True)
-    lock_window.overrideredirect(True)
-
-    # Prevent closing by taskbar/shortcuts
-    lock_window.protocol("WM_DELETE_WINDOW", lambda: "break")
-
-    # Install Windows low-level hook overrides
     if os.name == 'nt' and keyboard:
         try:
             keyboard.block_key('windows')
-            keyboard.add_hotkey('alt+tab', lambda: None, suppress=True)
-            keyboard.add_hotkey('alt+f4', lambda: None, suppress=True)
-            keyboard.add_hotkey('alt+esc', lambda: None, suppress=True)
-            keyboard.add_hotkey('ctrl+esc', lambda: None, suppress=True)
-            keyboard.add_hotkey('windows+d', lambda: None, suppress=True)
-            keyboard.add_hotkey('windows+r', lambda: None, suppress=True)
+            for shortcut in ('alt+tab', 'alt+f4', 'alt+esc', 'ctrl+esc', 'windows+d', 'windows+r'):
+                keyboard.add_hotkey(shortcut, lambda: None, suppress=True)
         except Exception as error:
             keyboard_error = str(error)
     elif os.name == 'nt':
         keyboard_error = 'Keyboard hook dependency is unavailable'
+    window.bind("<Alt-F4>", lambda event: "break")
+    window.bind("<Alt-Tab>", lambda event: "break")
 
-    # Binding events to reject default Tkinter close shortcuts
-    lock_window.bind_all("<Alt-F4>", lambda e: "break")
-    lock_window.bind_all("<Alt-Tab>", lambda e: "break")
+    def re_grab():
+        window._regrab_job = None
+        if window is not lock_window or window._closing or not is_locked:
+            return
+        dialog = window._settings_dialog
+        if dialog and dialog.winfo_exists():
+            return
+        if window.winfo_exists():
+            focused = window.focus_displayof()
+            if focused is not None and focused.winfo_toplevel() is window:
+                return
+            window.focus_force()
+            pwd_entry.focus_set()
+            window.grab_set()
 
-    # Lock focus inside this window
-    lock_window.focus_force()
-    lock_window.grab_set()
+    def schedule_regrab(event=None):
+        if not window._closing and window._regrab_job is None:
+            window._regrab_job = window.after(20, re_grab)
 
-    def re_grab(event=None):
-        with gui_lock:
-            active = is_locked
-        if active and lock_window:
-            lock_window.focus_force()
-            lock_window.grab_set()
-
-    # Re-apply grab if window loses focus
-    lock_window.bind("<FocusOut>", lambda e: lock_window.after(1, re_grab))
-
-    # Visitor instructions and local staff controls share a clear, responsive layout.
-    bg = "#101923"
-    lock_window.configure(bg=bg)
-    frame = tk.Frame(lock_window, bg=bg, padx=36, pady=24)
+    window.bind("<FocusOut>", schedule_regrab)
+    window.focus_force()
+    window.grab_set()
+    # Keep the form short enough for a 768px laptop screen, including Windows text scaling.
+    compact = window.winfo_screenheight() < 900
+    frame = tk.Frame(window, bg=UI_BG, padx=30, pady=18)
     frame.place(relx=0.5, rely=0.5, anchor="center")
-    wrap = max(280, min(720, lock_window.winfo_screenwidth() - 100))
-    tk.Label(frame, text="SIPANTAU  /  " + get_agent_hostname(), font=("Segoe UI", 12),
-             fg="#8aa5bb", bg=bg).pack(pady=(0, 18))
-    tk.Label(frame, text="Komputer terkunci", font=("Segoe UI", 30, "bold"),
-             fg="#f1f5f9", bg=bg).pack()
+    wrap = max(260, min(560, window.winfo_screenwidth() - 100))
+    tk.Label(frame, text=get_agent_hostname(), font=("Segoe UI", 12),
+             fg=UI_MUTED, bg=UI_BG).pack(anchor="w", pady=(0, 12))
+    tk.Label(frame, text="Komputer terkunci", font=("Segoe UI", 26 if compact else 32, "bold"),
+             fg=UI_TEXT, bg=UI_BG).pack(anchor="w")
     tk.Label(frame, text="Hubungi petugas untuk memulai sesi penggunaan.",
-             font=("Segoe UI", 14), fg="#becbd6", bg=bg, wraplength=wrap).pack(pady=(10, 20))
-    status = tk.Label(frame, font=("Segoe UI", 11), bg=bg)
-    status.pack(pady=(0, 22))
+             font=("Segoe UI", 12), fg=UI_MUTED, bg=UI_BG, wraplength=wrap,
+             justify="left").pack(anchor="w", pady=(8, 10))
+    status = tk.Label(frame, font=("Segoe UI", 10), bg=UI_BG)
+    status.pack(anchor="w", pady=(0, 18))
+
     def update_connection_status():
-        if not lock_window or not status.winfo_exists():
+        if window is not lock_window or window._closing or not status.winfo_exists():
             return
         connected = LAST_HEARTBEAT is not None and time.monotonic() - LAST_HEARTBEAT < 60
-        status.config(text="Terhubung ke server" if connected else
-                      "Server tidak terhubung · akses petugas tetap tersedia",
-                      fg="#73d4b0" if connected else "#e4bb78")
-        status.after(2000, update_connection_status)
+        status.config(text="●  Terhubung ke server" if connected else "●  Server tidak terhubung · akses lokal tersedia",
+                      fg=UI_ACCENT if connected else "#e9ba72")
+        window._status_job = window.after(2000, update_connection_status)
+
     update_connection_status()
-    tk.Label(frame, text="Akses petugas", font=("Segoe UI", 13, "bold"),
-             fg="#f1f5f9", bg=bg).pack(anchor="w")
-    pwd_entry = tk.Entry(frame, show="*", font=("Segoe UI", 14), bg="#213142",
-                         fg="white", insertbackground="white", relief="flat", width=28)
-    pwd_entry.pack(fill="x", pady=(10, 14), ipady=8)
-    tk.Label(frame, text="Durasi sesi (menit)", font=("Segoe UI", 11),
-             fg="#becbd6", bg=bg).pack(anchor="w")
-    minutes = tk.StringVar(value="60")
-    duration_entry = tk.Spinbox(frame, from_=1, to=1440, textvariable=minutes,
-                               font=("Segoe UI", 14), width=8, bg="#213142", fg="white",
-                               insertbackground="white", relief="flat")
-    duration_entry.pack(anchor="w", pady=8)
-    presets = tk.Frame(frame, bg=bg)
-    presets.pack(anchor="w", pady=(0, 12))
-    for value in (30, 60, 120):
-        tk.Button(presets, text=f"{value} menit", command=lambda v=value: minutes.set(str(v)),
-                  bg="#213142", fg="white", relief="flat", padx=12, pady=5).pack(side="left", padx=(0, 8))
-    error_label = tk.Label(frame, text="", font=("Segoe UI", 11), fg="#ffb4b4",
-                           bg=bg, wraplength=wrap)
-    error_label.pack()
+    tk.Label(frame, text="Password petugas", font=("Segoe UI", 11, "bold"),
+             fg=UI_TEXT, bg=UI_BG).pack(anchor="w", pady=(0, 8))
+    password_row = tk.Frame(frame, bg=UI_INPUT, highlightthickness=1, highlightbackground="#405562")
+    password_row.pack(fill="x")
+    pwd_entry = tk.Entry(password_row, show="•", font=("Segoe UI", 14), bg=UI_INPUT,
+                         fg=UI_TEXT, insertbackground=UI_TEXT, relief="flat", width=27)
+    pwd_entry.pack(side="left", fill="x", expand=True, padx=(12, 0), ipady=9)
+    window._password_entry = pwd_entry
+    eye = tk.Canvas(password_row, width=40, height=36, bg=UI_INPUT, highlightthickness=1,
+                    highlightbackground=UI_INPUT, highlightcolor=UI_ACCENT,
+                    takefocus=1, cursor="hand2")
+    eye.pack(side="right", padx=4)
+    draw_password_eye(eye, False)
+
+    def toggle_password(event=None):
+        visible = bool(pwd_entry.cget("show"))
+        pwd_entry.config(show="" if visible else "•")
+        draw_password_eye(eye, visible)
+        return "break"
+
+    eye.bind("<Button-1>", toggle_password)
+    eye.bind("<Return>", toggle_password)
+    eye.bind("<space>", toggle_password)
+    eye.bind("<Enter>", lambda event: eye.config(highlightbackground=UI_MUTED))
+    eye.bind("<Leave>", lambda event: eye.config(highlightbackground=UI_INPUT))
+    tk.Label(frame, text="Durasi sesi", font=("Segoe UI", 11), fg=UI_MUTED,
+             bg=UI_BG).pack(anchor="w", pady=(16, 8))
+    minutes = tk.StringVar(value="30")
+    presets = tk.Frame(frame, bg=UI_BG)
+    presets.pack(fill="x")
+    preset_buttons = []
+
+    def select_duration(value):
+        minutes.set(str(value))
+        for duration, button in preset_buttons:
+            selected = duration == value
+            button.config(bg=UI_ACCENT if selected else UI_INPUT,
+                          fg=UI_BG if selected else UI_TEXT)
+
+    for value, label in TIMER_PRESETS:
+        button = tk.Button(presets, text=label, command=lambda value=value: select_duration(value),
+                           font=("Segoe UI", 11), relief="flat", pady=8, cursor="hand2",
+                           activebackground="#a4ddcf", activeforeground=UI_BG)
+        button.pack(side="left", fill="x", expand=True, padx=(0, 8 if value != 180 else 0))
+        preset_buttons.append((value, button))
+    select_duration(30)
+    custom = tk.Frame(frame, bg=UI_BG)
+    custom.pack(fill="x", pady=(10, 0))
+    tk.Label(custom, text="Atau atur menit", font=("Segoe UI", 10), fg=UI_MUTED,
+             bg=UI_BG).pack(side="left", padx=(0, 10))
+    duration_entry = tk.Spinbox(custom, from_=1, to=1440, textvariable=minutes,
+                               font=("Segoe UI", 11), width=6, bg=UI_INPUT, fg=UI_TEXT,
+                               insertbackground=UI_TEXT, relief="flat", buttonbackground=UI_INPUT)
+    duration_entry.pack(side="left", ipady=4)
+
+    def duration_changed(*args):
+        for duration, button in preset_buttons:
+            selected = minutes.get() == str(duration)
+            button.config(bg=UI_ACCENT if selected else UI_INPUT,
+                          fg=UI_BG if selected else UI_TEXT)
+
+    minutes.trace_add("write", duration_changed)
+    error_label = tk.Label(frame, text="", font=("Segoe UI", 10), fg="#f5a8a8",
+                           bg=UI_BG, wraplength=wrap, justify="left", anchor="w")
+    error_label.pack(fill="x", pady=(8, 0))
+    pwd_entry.bind("<KeyRelease>", lambda event: error_label.config(text=""))
+
     def handle_access(timed=True):
+        error_label.config(text="")
         try:
-            duration = int(minutes.get()) if timed else None
+            if timed:
+                try:
+                    duration = int(minutes.get())
+                except ValueError:
+                    raise ValueError("Durasi harus 1–1440 menit.") from None
+            else:
+                duration = None
             pending_id = authorize_local_access(pwd_entry.get(), duration)
             pwd_entry.delete(0, tk.END)
-            apply_local_gui(pending_id)
-        except ValueError as error:
-            pwd_entry.delete(0, tk.END)
-            error_label.config(text=str(error))
+            pwd_entry.config(show="•")
+            draw_password_eye(eye, False)
+            if not apply_local_gui(pending_id):
+                raise RuntimeError(local_state.get("control_error") or "Status komputer berubah. Silakan coba lagi.")
+        except (ValueError, RuntimeError) as error:
+            if window.winfo_exists():
+                error_label.config(text=str(error))
+            else:
+                messagebox.showwarning("Akses petugas", str(error), parent=root)
+
     tk.Button(frame, text="Mulai sesi dengan timer", font=("Segoe UI", 12, "bold"),
-              bg="#317d9b", fg="white", activebackground="#24647e", activeforeground="white",
-              relief="flat", pady=10, command=handle_access).pack(fill="x", pady=(10, 8))
-    tk.Button(frame, text="Buka tanpa batas waktu", font=("Segoe UI", 11),
-              bg="#213142", fg="#becbd6", relief="flat", pady=8,
-              command=lambda: handle_access(False)).pack(fill="x")
+              bg=UI_ACCENT, fg=UI_BG, activebackground="#a4ddcf", activeforeground=UI_BG,
+              relief="flat", pady=10, cursor="hand2", command=handle_access).pack(fill="x", pady=(8, 6))
+    tk.Button(frame, text="Buka tanpa batas waktu", font=("Segoe UI", 10),
+              bg=UI_BG, fg=UI_MUTED, activebackground=UI_INPUT, activeforeground=UI_TEXT,
+              relief="flat", pady=6, cursor="hand2", command=lambda: handle_access(False)).pack(fill="x")
     pwd_entry.bind("<Return>", lambda event: handle_access(True))
+
+    # Invisible hit area becomes a settings button on hover or keyboard focus.
+    settings = tk.Canvas(window, width=44, height=44, bg=UI_BG, highlightthickness=0,
+                         takefocus=1, cursor="hand2")
+    tk.Label(window, text=f"Versi {VERSION}", font=("Segoe UI", 9), fg=UI_MUTED,
+             bg=UI_BG).place(relx=0, rely=1, x=22, y=-28, anchor="sw")
+    settings.place(relx=1, rely=1, x=-18, y=-18, anchor="se")
+    gear = settings.create_text(22, 22, text="⚙", font=("Segoe UI Symbol", 21), fill=UI_BG)
+    settings.bind("<Enter>", lambda event: settings.itemconfig(gear, fill=UI_MUTED))
+    settings.bind("<Leave>", lambda event: settings.itemconfig(gear, fill=UI_BG))
+    settings.bind("<FocusIn>", lambda event: settings.itemconfig(gear, fill=UI_ACCENT))
+    settings.bind("<FocusOut>", lambda event: settings.itemconfig(gear, fill=UI_BG))
+
+    def open_settings(event=None):
+        pwd_entry.config(show="•")
+        draw_password_eye(eye, False)
+        show_configuration_viewer(window)
+        return "break"
+
+    settings.bind("<Button-1>", open_settings)
+    settings.bind("<Return>", open_settings)
+    settings.bind("<space>", open_settings)
     pwd_entry.focus_set()
     with gui_lock:
         is_locked = True
@@ -605,29 +867,47 @@ def show_lock_screen_gui():
     if lock_health_error:
         raise RuntimeError(lock_health_error)
 
+
 def hide_lock_screen_gui():
     global lock_window, is_locked, lock_health_error
+    window = lock_window
     with gui_lock:
-        if not is_locked and not lock_health_error:
+        if window is None and not is_locked and not lock_health_error:
             return
     keyboard_error = None
-
-    # Remove low-level Windows keyboard hooks
     if os.name == 'nt' and keyboard:
         try:
             keyboard.unhook_all()
         except Exception as error:
             keyboard_error = str(error)
-
-    if lock_window:
-        lock_window.grab_release()
-        lock_window.destroy()
-        lock_window = None
+    if window is not None:
+        window._closing = True
+        window.unbind("<FocusOut>")
+        for name in ("_regrab_job", "_status_job"):
+            job = getattr(window, name, None)
+            if job:
+                try:
+                    window.after_cancel(job)
+                except tk.TclError:
+                    pass
+        # A transferred/already-released grab must never prevent destruction.
+        try:
+            window.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            window.destroy()
+        except tk.TclError:
+            if window.winfo_exists():
+                raise
+        if lock_window is window:
+            lock_window = None
     with gui_lock:
         is_locked = False
     lock_health_error = 'Shortcut hooks could not be released: ' + keyboard_error if keyboard_error else None
     if lock_health_error:
         raise RuntimeError(lock_health_error)
+
 
 def rearrange_notifications():
     with notification_lock:
@@ -768,255 +1048,168 @@ def drag_motion(event):
     win = event.widget.winfo_toplevel()
     dx = event.x - win._drag_x
     dy = event.y - win._drag_y
-    x = win.winfo_x() + dx
-    y = win.winfo_y() + dy
+    x = max(0, min(win.winfo_x() + dx, win.winfo_screenwidth() - win.winfo_width()))
+    y = max(0, min(win.winfo_y() + dy, win.winfo_screenheight() - win.winfo_height()))
     win.geometry(f"+{x}+{y}")
 
 # --- Stop session action ---
 def stop_session_action():
-    if messagebox.askyesno("Hentikan Sesi", "Apakah Anda yakin ingin menghentikan sesi sekarang?\nKomputer Anda akan langsung dikunci."):
+    if messagebox.askyesno("Akhiri sesi", "Akhiri sesi sekarang?\nKomputer akan langsung dikunci.", parent=timer_window or root):
         pending_id = set_local_control(True, "force-lock")
         apply_local_gui(pending_id)
+
+def dismiss_timer_window():
+    global timer_window
+    window = timer_window
+    timer_window = None
+    if window is not None:
+        try:
+            window.destroy()
+        except tk.TclError:
+            pass
+
+
+def timer_display(remaining):
+    seconds = max(0, math.ceil(remaining))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    clock = f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+    if remaining < 180:
+        return clock, "#f29797", "Sesi segera berakhir.\nSimpan pekerjaan Anda sekarang.", True
+    if remaining < 600:
+        return clock, "#e9ba72", "Kurang dari 10 menit.\nSimpan pekerjaan sebelum sesi berakhir.", True
+    return clock, UI_ACCENT, "Seret panel untuk memindahkannya.\nAkhiri sesi setelah selesai.", False
+
 
 # --- Floating countdown timer widget ---
 def show_timer_window_gui():
     global timer_window
     if timer_window is not None:
         return
-        
-    timer_window = tk.Toplevel(root)
-    timer_window.configure(bg="#222222")
-    timer_window.overrideredirect(True)  # borderless
-    timer_window.attributes("-topmost", True)
-    
-    # Drag-and-drop bindings
-    timer_window.bind("<Button-1>", start_drag)
-    timer_window.bind("<B1-Motion>", drag_motion)
-    
-    # Internal variables to track dragging
-    timer_window._drag_x = 0
-    timer_window._drag_y = 0
-    
-    # Position widget in the top-right corner of the screen
-    screen_width = timer_window.winfo_screenwidth()
-    width = 240
-    height = 90
-    x = screen_width - width - 40
-    y = 40
-    timer_window.geometry(f"{width}x{height}+{x}+{y}")
-    
-    # Main container frame
-    container = tk.Frame(timer_window, bg="#222222", bd=1, relief="solid", highlightbackground="#3b82f6", highlightcolor="#3b82f6", highlightthickness=1)
+    window = tk.Toplevel(root)
+    timer_window = window
+    window.configure(bg=UI_PANEL)
+    window.overrideredirect(True)
+    window.attributes("-topmost", True)
+    window._drag_x = 0
+    window._drag_y = 0
+    window.mouse_inside = False
+    window.layout_expanded = None
+    window.session_identity = None
+    window.session_total = 1
+    window.geometry(f"280x104+{max(0, window.winfo_screenwidth() - 304)}+24")
+    container = tk.Frame(window, bg=UI_PANEL, padx=16, pady=12,
+                         highlightthickness=1, highlightbackground="#3c515d")
     container.pack(fill="both", expand=True)
-    container.bind("<Button-1>", start_drag)
-    container.bind("<B1-Motion>", drag_motion)
-    timer_window.container_frame = container
-    
-    # Text label for countdown
-    time_label = tk.Label(container, text="", font=("Helvetica", 14, "bold"), fg="#3b82f6", bg="#222222")
-    time_label.pack(pady=(10, 2))
-    time_label.bind("<Button-1>", start_drag)
-    time_label.bind("<B1-Motion>", drag_motion)
-    timer_window.time_label = time_label
-    
-    # Warning description label
-    desc_label = tk.Label(container, text="", font=("Helvetica", 8), fg="#ef4444", bg="#222222", wraplength=220)
-    desc_label.pack(pady=0)
-    desc_label.bind("<Button-1>", start_drag)
-    desc_label.bind("<B1-Motion>", drag_motion)
-    timer_window.desc_label = desc_label
-    
-    # Stop Session Button
-    stop_btn = tk.Button(
-        container,
-        text="Hentikan Sesi",
-        font=("Helvetica", 9, "bold"),
-        bg="#dc2626",
-        fg="white",
-        activebackground="#b91c1c",
-        activeforeground="white",
-        relief="flat",
-        bd=0,
-        command=stop_session_action
-    )
-    stop_btn.pack(pady=(2, 10))
-    timer_window.stop_btn = stop_btn
-
-    # Hover detection to support distraction-free mode
-    timer_window.mouse_inside = False
+    window.container_frame = container
+    heading = tk.Frame(container, bg=UI_PANEL)
+    heading.pack(fill="x")
+    title = tk.Label(heading, text="Sisa waktu", font=("Segoe UI", 9), fg=UI_MUTED, bg=UI_PANEL)
+    title.pack(side="left")
+    pc = get_agent_hostname()
+    name = tk.Label(heading, text=pc[:19] + ("…" if len(pc) > 19 else ""),
+                    font=("Segoe UI", 9), fg=UI_MUTED, bg=UI_PANEL)
+    name.pack(side="right")
+    time_label = tk.Label(container, text="", font=("Consolas", 26, "bold"), fg=UI_ACCENT,
+                          bg=UI_PANEL, anchor="w")
+    time_label.pack(fill="x", pady=(2, 7))
+    window.time_label = time_label
+    progress = tk.Canvas(container, height=3, bg=UI_INPUT, highlightthickness=0)
+    progress.pack(fill="x")
+    window.progress = progress
+    window.progress_fill = progress.create_rectangle(0, 0, 248, 3, fill=UI_ACCENT, outline="")
+    details = tk.Frame(container, bg=UI_PANEL)
+    window.details_frame = details
+    description = tk.Label(details, text="", font=("Segoe UI", 9), fg=UI_MUTED, bg=UI_PANEL,
+                           anchor="w", justify="left", wraplength=245)
+    description.pack(fill="x", pady=(10, 8))
+    window.desc_label = description
+    stop = tk.Button(details, text="Akhiri sesi", font=("Segoe UI", 10), bg=UI_INPUT,
+                     fg=UI_TEXT, activebackground="#405563", activeforeground=UI_TEXT,
+                     relief="flat", pady=5, cursor="hand2", command=stop_session_action)
+    stop.pack(fill="x")
+    window.stop_btn = stop
 
     def on_enter(event):
-        timer_window.mouse_inside = True
-        update_timer_layout()
+        if window is timer_window:
+            window.mouse_inside = True
+            update_timer_layout()
 
     def on_leave(event):
-        try:
-            x, y = timer_window.winfo_pointerxy()
-            wx = timer_window.winfo_rootx()
-            wy = timer_window.winfo_rooty()
-            ww = timer_window.winfo_width()
-            wh = timer_window.winfo_height()
-            if not (wx <= x < wx + ww and wy <= y < wy + wh):
-                timer_window.mouse_inside = False
-                update_timer_layout()
-        except Exception:
-            pass
+        if window is not timer_window:
+            return
+        x, y = window.winfo_pointerxy()
+        if not (window.winfo_rootx() <= x < window.winfo_rootx() + window.winfo_width()
+                and window.winfo_rooty() <= y < window.winfo_rooty() + window.winfo_height()):
+            window.mouse_inside = False
+            update_timer_layout()
 
-    # Bind hover listeners to the window and container elements
-    for widget in (timer_window, container, time_label, desc_label, stop_btn):
+    draggable = (container, heading, title, name, time_label, progress, details, description)
+    for widget in draggable:
+        widget.bind("<Button-1>", start_drag)
+        widget.bind("<B1-Motion>", drag_motion)
+    for widget in (window, *draggable, stop):
         widget.bind("<Enter>", on_enter, add="+")
         widget.bind("<Leave>", on_leave, add="+")
+    # Keep controls expanded while the panel receives keyboard focus.
+    window.bind("<FocusIn>", on_enter, add="+")
+    stop.bind("<FocusIn>", on_enter, add="+")
+    stop.bind("<FocusOut>", on_leave, add="+")
+    update_timer_layout()
+
 
 def update_timer_layout():
-    global timer_window
-    if not timer_window:
+    window = timer_window
+    if window is None:
         return
-        
-    with STATE_LOCK:
-        remaining = int(SESSION_CLOCK.remaining() or 0)
-
-    if remaining <= 0:
-        if timer_window is not None:
-            try:
-                timer_window.destroy()
-            except Exception:
-                pass
-            timer_window = None
-        return
-
-    mouse_inside = getattr(timer_window, "mouse_inside", False)
-    
-    if remaining >= 600:
-        # Distraction-free mode when remaining time is >= 10 mins
-        hrs = remaining // 3600
-        mins = (remaining % 3600) // 60
-        if hrs > 0:
-            time_str = f"Sisa: {hrs} jam {mins} menit"
-        else:
-            time_str = f"Sisa: {mins} menit"
-            
-        if mouse_inside:
-            # Expanded state on hover
-            timer_window.container_frame.config(bg="#222222", highlightbackground="#3b82f6")
-            timer_window.time_label.config(text=time_str, fg="#3b82f6", bg="#222222")
-            timer_window.desc_label.config(text="", bg="#222222")
-            
-            # Repack elements to ensure correct layout and spacing
-            timer_window.time_label.pack_forget()
-            timer_window.desc_label.pack_forget()
-            timer_window.stop_btn.pack_forget()
-            
-            timer_window.time_label.pack(pady=(10, 2))
-            timer_window.desc_label.pack(pady=0)
-            timer_window.stop_btn.pack(pady=(2, 10))
-            
-            timer_window.geometry("240x90")
-            try:
-                timer_window.attributes("-alpha", 0.95)
-            except Exception:
-                pass
-        else:
-            # Compact state when idle
-            timer_window.container_frame.config(bg="#222222", highlightbackground="#3b82f6")
-            timer_window.time_label.config(text=time_str, fg="#3b82f6", bg="#222222")
-            timer_window.desc_label.config(text="", bg="#222222")
-            
-            timer_window.time_label.pack_forget()
-            timer_window.desc_label.pack_forget()
-            timer_window.stop_btn.pack_forget()
-            
-            timer_window.time_label.pack(pady=(10, 10)) # centered vertically
-            
-            timer_window.geometry("180x45")
-            try:
-                timer_window.attributes("-alpha", 0.65)
-            except Exception:
-                pass
-                
-        timer_window.attributes("-topmost", True)
-        
-    elif remaining >= 180:
-        # Warning mode (orange border)
-        mins = remaining // 60
-        secs = remaining % 60
-        time_str = f"Sisa: {mins:02d}:{secs:02d}"
-        
-        timer_window.container_frame.config(bg="#222222", highlightbackground="#f97316")
-        timer_window.time_label.config(text=time_str, fg="#f97316", bg="#222222")
-        timer_window.desc_label.config(text="", bg="#222222")
-        
-        timer_window.time_label.pack_forget()
-        timer_window.desc_label.pack_forget()
-        timer_window.stop_btn.pack_forget()
-        
-        timer_window.time_label.pack(pady=(10, 2))
-        timer_window.desc_label.pack(pady=0)
-        timer_window.stop_btn.pack(pady=(2, 10))
-        
-        timer_window.geometry("240x90")
-        try:
-            timer_window.attributes("-alpha", 0.95)
-        except Exception:
-            pass
-        timer_window.attributes("-topmost", True)
-        
-    else:
-        # Critical warning mode (red background)
-        mins = remaining // 60
-        secs = remaining % 60
-        time_str = f"Sisa: {mins:02d}:{secs:02d}"
-        alert_text = "PERINGATAN: Sesi hampir habis!\nSegera simpan pekerjaan Anda!"
-        
-        timer_window.container_frame.config(bg="#450a0a", highlightbackground="#ef4444")
-        timer_window.time_label.config(text=time_str, fg="#fca5a5", bg="#450a0a")
-        timer_window.desc_label.config(text=alert_text, fg="#ffffff", bg="#450a0a")
-        
-        timer_window.time_label.pack_forget()
-        timer_window.desc_label.pack_forget()
-        timer_window.stop_btn.pack_forget()
-        
-        timer_window.time_label.pack(pady=(10, 2))
-        timer_window.desc_label.pack(pady=0)
-        timer_window.stop_btn.pack(pady=(2, 10))
-        
-        timer_window.geometry("240x120")
-        try:
-            timer_window.attributes("-alpha", 1.0)
-        except Exception:
-            pass
-        timer_window.attributes("-topmost", True)
-
-def update_timer_gui():
-    global timer_window
-    
     with STATE_LOCK:
         remaining = SESSION_CLOCK.remaining()
-        active = not local_state["is_locked"] and remaining is not None
-
-    if active:
-        if remaining > 0:
-            if timer_window is None:
-                show_timer_window_gui()
-                
-            if timer_window:
-                update_timer_layout()
+        identity = (local_state.get("session_id"), local_state.get("expires_at"))
+        duration = local_state.get("duration")
+    if remaining is None or remaining <= 0:
+        dismiss_timer_window()
+        return
+    if identity != window.session_identity:
+        window.session_identity = identity
+        window.session_total = max(remaining, duration if isinstance(duration, (int, float)) else 0, 1)
+    clock, accent, message, warning = timer_display(remaining)
+    expanded = warning or window.mouse_inside
+    window.time_label.config(text=clock, fg=accent)
+    window.desc_label.config(text=message, fg=accent if warning else UI_MUTED)
+    window.container_frame.config(highlightbackground=accent if warning else "#3c515d")
+    track_width = max(1, window.progress.winfo_width())
+    fraction = max(0, min(1, remaining / window.session_total))
+    window.progress.coords(window.progress_fill, 0, 0, track_width * fraction, 3)
+    window.progress.itemconfig(window.progress_fill, fill=accent)
+    if expanded != window.layout_expanded:
+        window.layout_expanded = expanded
+        if expanded:
+            window.details_frame.pack(fill="x")
         else:
-            if timer_window is not None:
-                try:
-                    timer_window.destroy()
-                except Exception:
-                    pass
-                timer_window = None
+            window.details_frame.pack_forget()
+        height = 194 if expanded else 104
+        x = max(0, min(window.winfo_x(), window.winfo_screenwidth() - 280))
+        y = max(0, min(window.winfo_y(), window.winfo_screenheight() - height))
+        window.geometry(f"280x{height}+{x}+{y}")
+
+
+def update_timer_gui():
+    with STATE_LOCK:
+        remaining = SESSION_CLOCK.remaining()
+        desired_active = not local_state["is_locked"] and remaining is not None and remaining > 0
+    with gui_lock:
+        # Do not show a countdown over a failed or not-yet-applied unlock.
+        visible_unlocked = not is_locked and lock_window is None and not lock_health_error
+    if desired_active and visible_unlocked:
+        if timer_window is None:
+            show_timer_window_gui()
+        else:
+            update_timer_layout()
     else:
-        if timer_window is not None:
-            try:
-                timer_window.destroy()
-            except Exception:
-                pass
-            timer_window = None
-            
+        dismiss_timer_window()
     if root:
         root.after(1000, update_timer_gui)
+
 
 # 8. Background Process Blocked Apps Watcher Thread
 def blacklist_watcher():
@@ -1424,14 +1617,12 @@ if __name__ == "__main__":
         instance_mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\SIPANTAUAgent")
         if not instance_mutex or ctypes.windll.kernel32.GetLastError() == 183:
             sys.exit(0)
-    from urllib.parse import urlparse
-    server = urlparse(config.get("server_url", ""))
-    if server.scheme not in ('http', 'https') or not server.hostname or len(config.get("api_key", "")) < 32:
-        logging.error('Set a valid server_url and an API key of at least 32 characters in config.json.')
-        sys.exit(1)
-    # Initialize Tkinter system first on the main thread
+    # A real Tk parent makes startup warnings visible even for --noconsole releases.
     root = tk.Tk()
-    root.withdraw() # Hide root controller window
+    root.withdraw()
+    if not startup_config_ready(root):
+        root.destroy()
+        sys.exit(1)
 
     # Load persistent state from state.json cache
     load_state()

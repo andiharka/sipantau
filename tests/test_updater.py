@@ -95,3 +95,33 @@ class UpdaterTests(unittest.TestCase):
         self.assertIn('[System.IO.File]::Copy($backup, $target, $true)', script)
         self.assertIn('taskkill.exe', script)
         self.assertIn('phase = $phase; error = $detail', script)
+
+    def test_manual_check_uses_verified_public_metadata_without_download_or_install(self):
+        with mock.patch.object(updater.requests, 'Session') as session, mock.patch.object(updater, 'download_asset') as download:
+            client = session.return_value.__enter__.return_value
+            client.get.return_value.json.return_value = release()
+            selected = updater.check_for_update('1.0.0')
+            self.assertEqual(selected[0], 'v1.2.0')
+            client.get.assert_called_once_with(
+                f'https://api.github.com/repos/{updater.REPOSITORY}/releases/latest', timeout=(5, 15), verify=True)
+            client.headers.update.assert_called_once_with(
+                {'Accept': 'application/vnd.github+json', 'User-Agent': 'SIPANTAU-Updater'})
+            download.assert_not_called()
+            client.get.return_value.json.return_value = release(tag='v1.0.0')
+            self.assertIsNone(updater.check_for_update('1.0.0'))
+
+    def test_manual_check_rejects_untrusted_assets_and_non_stable_metadata(self):
+        bad_asset = release()
+        bad_asset['assets'][0]['browser_download_url'] = 'https://other.example/SIPANTAU.exe'
+        for data in [bad_asset, [], {**release(), 'prerelease': True}, {**release(), 'draft': True}]:
+            with self.subTest(kind=type(data).__name__), mock.patch.object(updater.requests, 'Session') as session:
+                session.return_value.__enter__.return_value.get.return_value.json.return_value = data
+                with self.assertRaises(ValueError):
+                    updater.check_for_update('1.0.0')
+
+    def test_manual_check_propagates_offline_and_http_errors(self):
+        for error in [updater.requests.ConnectionError('offline'), updater.requests.HTTPError('not found')]:
+            with self.subTest(error=type(error).__name__), mock.patch.object(updater.requests, 'Session') as session:
+                session.return_value.__enter__.return_value.get.side_effect = error
+                with self.assertRaises(type(error)):
+                    updater.check_for_update('1.0.0')

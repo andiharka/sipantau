@@ -15,7 +15,7 @@ This is a Python-based administration agent designed to run on Windows 10 client
 
 ## Configuration
 
-Place `config.json` beside the complete Python source checkout (or the compiled `.exe`). Keep the helper modules `control_runtime.py`, `client_logging.py`, `updater.py`, `windows_runtime.py`, `remote_commands.py`, `screenshot_codec.py`, and `version.py` alongside `agent.py` when running from source. Obtain a shared bootstrap key or an individual PC key from the Perpusip administrator. The API key must contain at least 32 characters.
+Place `config.json` beside the complete Python source checkout (or the compiled `.exe`). Keep the helper modules `control_runtime.py`, `client_logging.py`, `client_config.py`, `updater.py`, `windows_runtime.py`, `remote_commands.py`, `screenshot_codec.py`, and `version.py` alongside `agent.py` when running from source. Obtain a shared bootstrap key or an individual PC key from the Perpusip administrator. The API key must contain at least 32 characters.
 
 ```json
 {
@@ -121,10 +121,10 @@ Run `python -m unittest discover -s tests -v` for protocol and countdown tests. 
 
 On the lock screen, staff can enter the configured `master_password` and choose:
 
-- **Mulai sesi dengan timer:** 1–1440 minutes, with 30/60/120 minute presets. Enter starts this mode by default. The PC unlocks immediately and relocks when time runs out, even if Perpusip and the internet are unreachable.
+- **Mulai sesi dengan timer:** 1–1440 minutes, with **30 menit**, **1 jam**, and **3 jam** presets; 30 minutes is selected initially. Enter starts this mode by default. The PC unlocks immediately and relocks when time runs out, even if Perpusip and the internet are unreachable.
 - **Buka tanpa batas waktu:** unlock until a staff/server lock command or the configured startup lock policy. This still requires the password.
 
-The floating countdown and **Hentikan Sesi** work locally. Cached application rules continue to be enforced. Cached website rules are reapplied at startup independently of network requests; changes remove only `# agent-blocked` entries. The initial cache can only contain rules previously received from Perpusip. Without a cache there are no rules to enforce, and the default local lock remains available.
+The floating countdown and **Akhiri sesi** work locally. Cached application rules continue to be enforced. Cached website rules are reapplied at startup independently of network requests; changes remove only `# agent-blocked` entries. The initial cache can only contain rules previously received from Perpusip. Without a cache there are no rules to enforce, and the default local lock remains available.
 
 New internet connectivity is not required for Perpusip control when the LAN server remains reachable. With the server unreachable, new remote commands, rule changes and member lookups wait for connectivity. The lock screen shows server connection status, not general internet status.
 
@@ -158,7 +158,7 @@ The log records starts, local timer starts, process blocking, command failures a
 
 A physical Windows acceptance run is still required for the real fullscreen layout, administrator keyboard hooks, multi-monitor setup, native lock policies, packaged startup, and UAC environment. Unplug networking; start a short local timer and verify expiry; restart during a cached session; verify cached blockers; reconnect after a newer remote command; then test an opt-in update and rollback on a spare PC. Local automated tests cannot prove these Windows desktop interactions.
 
-Further overlay ideas: a collapsible staff panel (cleaner visitor view), keyboard-accessible password visibility toggle, configurable library branding/help contact, scaling across monitor resolutions, and multi-monitor lock coverage. The implemented screen already separates visitor instructions from staff access, shows the PC name and server status, and makes timed access the primary action.
+Further overlay ideas: a collapsible staff panel, configurable library help contact, and multi-monitor lock coverage. The implemented screen separates visitor instructions from staff access, shows the PC name and server status without a product heading, and makes timed access the primary action.
 
 
 ## Server screenshot and shutdown commands
@@ -201,3 +201,19 @@ The installer records `phase`, `error`, and the launched `agent_pid` in `update-
 Windows installer tests use a real temporary parent process. Every test waits for or stops only its own dummy executables before deleting their directory, including when an assertion fails. Checksum rejection, successful readiness and failed-startup rollback are tested separately, with phase/error diagnostics included in failed assertions. The Windows test workflow runs on pull requests independently of tagged releases, so these checks can be verified before publishing a new executable.
 
 The installer computes the staged SHA-256 using .NET with a file stream, disposing the stream before replacement. It does not depend on the `Get-FileHash` cmdlet, which can be unavailable in inherited PowerShell environments. All three native installer tests deliberately disable that cmdlet to cover this failure. Both Windows workflows use Node 24 versions of checkout and setup-python.
+
+
+### Startup configuration and staff controls
+
+At every process start, the client reads `config.json` beside the executable (or beside `agent.py` for source runs), independent of the working directory. It accepts UTF-8 with or without a BOM. Missing/unreadable files, invalid JSON or field types, invalid connection settings, and a missing/blank staff password show a warning dialog containing the exact file path. The process exits before loading the kiosk or keyboard hooks. There is no default master password; configure a private nonempty value before starting. Configuration is read once per process; restart after editing it. The startup log records the loaded path/time without credentials.
+
+The lock screen has a mouse- and keyboard-operated eye icon for password visibility. Presets are 30 minutes, 1 hour and 3 hours; custom durations of 1–1440 minutes remain available. Password errors clear on editing or another attempt. Unlock application also reconciles already-acknowledged local actions, so a fast heartbeat cannot skip dismissing the overlay. Old focus/status callbacks are cancelled on dismissal, an already-released grab cannot prevent destruction, and repeated lock commands reuse the same window.
+
+Hover over the bottom-right 44-pixel corner button (also reachable with Tab) to reveal settings. The viewer shows the configuration loaded at startup, its file path/time and the agent version. It uses an explicit field allowlist: staff passwords are never displayed, API keys show only the last four characters, URL credentials/query/fragment are removed, and unknown config fields are omitted. The viewer is read-only and closing it returns focus to the password field.
+
+The draggable timer uses a readable seconds countdown and a remaining-time bar. Hover or focus expands its controls. It automatically expands with an amber warning below ten minutes and a red warning below three minutes. The timer only appears after the lock overlay is actually dismissed; ending a session still requires confirmation and works offline.
+
+Config and UI regression tests cover BOM files, startup warnings and exact paths, secret masking, preset/eye/settings callbacks, wrong-then-correct password entry, early heartbeat acknowledgment, stale focus callbacks and failed unlocks. GUI widgets are simulated in local tests: verify the actual Windows appearance, hover/focus behavior, text scaling and keyboard hooks on a spare PC before rollout.
+
+
+The lock screen shows the running version in its bottom-left corner without a product heading. The hidden settings viewer includes **Periksa pembaruan**, which checks the latest public stable GitHub release in a background worker and reports an available version, an up-to-date version, connection/rate-limit failures, missing releases, or unverifiable metadata. It works independently of `auto_update`, uses verified HTTPS and the same release asset checks as the automatic updater, and does not download or install an executable. Closing/unlocking the screen while a check runs safely discards that dialog's result. Installation continues to use the existing opt-in automatic updater and its lock/readiness protections.

@@ -47,6 +47,23 @@ def select_asset(release, current):
     return tag, asset
 
 
+def fetch_update(session, current_version):
+    response = session.get(f'https://api.github.com/repos/{REPOSITORY}/releases/latest',
+                           timeout=(5, 15), verify=True)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict) or data.get('draft') or data.get('prerelease'):
+        raise ValueError('Expected public stable release metadata')
+    return select_asset(data, current_version)
+
+
+def check_for_update(current_version):
+    """Read and validate public release metadata independently of automatic-update opt-in."""
+    with requests.Session() as session:
+        session.headers.update({'Accept': 'application/vnd.github+json', 'User-Agent': 'SIPANTAU-Updater'})
+        return fetch_update(session, current_version)
+
+
 def download_asset(session, asset, destination):
     destination = Path(destination)
     part = destination.with_suffix('.part')
@@ -238,9 +255,7 @@ class ReleaseUpdater:
             return
         with requests.Session() as session:
             session.headers.update({'Accept': 'application/vnd.github+json', 'User-Agent': 'SIPANTAU-Updater'})
-            response = session.get(f'https://api.github.com/repos/{REPOSITORY}/releases/latest', timeout=(5, 15), verify=True)
-            response.raise_for_status()
-            selected = select_asset(response.json(), self.current_version)
+            selected = fetch_update(session, self.current_version)
             if selected is None:
                 return
             tag, asset = selected
