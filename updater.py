@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 import requests
+from version import BUILD_FORMAT
 
 REPOSITORY = 'andiharka/sipantau'
 MAX_DOWNLOAD = 128 * 1024 * 1024
@@ -25,20 +26,22 @@ def version_tuple(value):
     return tuple(int(n) for n in value.lstrip('v').split('.'))
 
 
-def select_asset(release, current):
+def select_asset(release, current, asset_name='SIPANTAU.exe'):
     if release.get('draft') or release.get('prerelease'):
         return None
     tag = release.get('tag_name')
     if version_tuple(tag) <= version_tuple(current):
         return None
-    assets = [a for a in release.get('assets', []) if a.get('name') == 'SIPANTAU.exe']
+    if asset_name not in ('SIPANTAU.exe', 'SIPANTAU-portable.zip'):
+        raise ValueError('Unexpected release asset name')
+    assets = [a for a in release.get('assets', []) if a.get('name') == asset_name]
     if len(assets) != 1:
-        raise ValueError('Release must contain exactly one SIPANTAU.exe')
+        raise ValueError('Release must contain exactly one ' + asset_name)
     asset = assets[0]
     digest = asset.get('digest', '')
     if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
         raise ValueError('Release executable has no SHA-256 digest')
-    expected_url = f'https://github.com/{REPOSITORY}/releases/download/{tag}/SIPANTAU.exe'
+    expected_url = f'https://github.com/{REPOSITORY}/releases/download/{tag}/{asset_name}'
     if asset.get('browser_download_url') != expected_url:
         raise ValueError('Unexpected release asset URL')
     size = asset.get('size')
@@ -47,21 +50,38 @@ def select_asset(release, current):
     return tag, asset
 
 
-def fetch_update(session, current_version):
+def fetch_release(session):
     response = session.get(f'https://api.github.com/repos/{REPOSITORY}/releases/latest',
                            timeout=(5, 15), verify=True)
     response.raise_for_status()
     data = response.json()
     if not isinstance(data, dict) or data.get('draft') or data.get('prerelease'):
         raise ValueError('Expected public stable release metadata')
+    return data
+
+
+def fetch_update(session, current_version):
+    data = fetch_release(session)
+    if version_tuple(data.get('tag_name')) <= version_tuple(current_version):
+        return None
+    # Folder-only releases deliberately omit the legacy executable if it failed scanning.
+    if not any(asset.get('name') == 'SIPANTAU.exe' for asset in data.get('assets', [])):
+        return None
     return select_asset(data, current_version)
 
 
 def check_for_update(current_version):
-    """Read and validate public release metadata independently of automatic-update opt-in."""
+    """Read verified metadata for the available package; never replace a folder's EXE alone."""
     with requests.Session() as session:
         session.headers.update({'Accept': 'application/vnd.github+json', 'User-Agent': 'SIPANTAU-Updater'})
-        return fetch_update(session, current_version)
+        data = fetch_release(session)
+        if version_tuple(data.get('tag_name')) <= version_tuple(current_version):
+            return None
+        preferred = ('SIPANTAU-portable.zip', 'SIPANTAU.exe') if BUILD_FORMAT == 'onedir' else ('SIPANTAU.exe', 'SIPANTAU-portable.zip')
+        for name in preferred:
+            if any(asset.get('name') == name for asset in data.get('assets', [])):
+                return select_asset(data, current_version, name)
+        raise ValueError('Release contains no supported Windows package')
 
 
 def download_asset(session, asset, destination):
@@ -241,7 +261,8 @@ def signal_ready(config_dir, locked, healthy):
 
 class ReleaseUpdater:
     def __init__(self, config, config_dir, current_version, enqueue, can_install, install):
-        self.enabled = config.get('auto_update', False) is True and os.name == 'nt' and getattr(sys, 'frozen', False)
+        self.supported = os.name == 'nt' and getattr(sys, 'frozen', False) and BUILD_FORMAT == 'onefile'
+        self.enabled = config.get('auto_update', False) is True and self.supported
         self.directory = Path(config_dir)
         self.current_version = current_version
         self.enqueue = enqueue

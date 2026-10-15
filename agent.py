@@ -14,7 +14,7 @@ from control_runtime import SessionClock, utc
 import logging
 from logging.handlers import RotatingFileHandler
 from client_logging import NetworkLog
-from version import VERSION
+from version import VERSION, BUILD_FORMAT
 import subprocess
 import tkinter as tk
 from tkinter import messagebox
@@ -567,7 +567,8 @@ def show_configuration_viewer(window):
     details.pack(fill="both", expand=True)
     scrollbar.config(command=details.yview)
     rows = [("File konfigurasi", config_path), ("Dibaca pada", CONFIG_LOADED_AT or "Tidak diketahui"),
-            ("Versi agen", VERSION), *configuration_summary(config, get_agent_hostname())]
+            ("Versi agen", VERSION), ("Format paket", {"onedir": "Folder lengkap", "onefile": "File tunggal", "source": "Python"}.get(BUILD_FORMAT, BUILD_FORMAT)),
+            *configuration_summary(config, get_agent_hostname(), update_supported=BUILD_FORMAT == "onefile")]
     details.insert("1.0", "\n\n".join(label + "\n" + str(value) for label, value in rows))
     details.config(state="disabled")
 
@@ -612,6 +613,8 @@ def show_configuration_viewer(window):
                 selected = check_for_update(VERSION)
                 if selected:
                     text = f"Pembaruan tersedia: {selected[0]}. Versi saat ini: v{VERSION}."
+                    if selected[1].get("name") == "SIPANTAU-portable.zip":
+                        text += " Unduh paket folder lengkap dan pasang secara manual."
                 else:
                     text = f"Versi v{VERSION} sudah yang terbaru."
                 color = UI_ACCENT

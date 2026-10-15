@@ -125,3 +125,32 @@ class UpdaterTests(unittest.TestCase):
                 session.return_value.__enter__.return_value.get.side_effect = error
                 with self.assertRaises(type(error)):
                     updater.check_for_update('1.0.0')
+
+    def test_folder_build_cannot_enable_executable_only_updates(self):
+        from types import SimpleNamespace
+        with mock.patch.object(updater, 'os', SimpleNamespace(name='nt')), mock.patch.object(updater.sys, 'frozen', True, create=True):
+            with mock.patch.object(updater, 'BUILD_FORMAT', 'onedir'):
+                update = updater.ReleaseUpdater({'auto_update': True}, '.', '1.0.0', mock.Mock(), lambda: True, mock.Mock())
+                self.assertFalse(update.supported)
+                with mock.patch.object(updater.requests, 'Session') as network:
+                    update.check_once()
+                    network.assert_not_called()
+            with mock.patch.object(updater, 'BUILD_FORMAT', 'onefile'):
+                update = updater.ReleaseUpdater({'auto_update': True}, '.', '1.0.0', mock.Mock(), lambda: True, mock.Mock())
+                self.assertTrue(update.enabled)
+
+    def test_folder_only_releases_are_visible_manually_and_skipped_by_executable_updater(self):
+        data = release()
+        asset = data['assets'][0]
+        asset['name'] = 'SIPANTAU-portable.zip'
+        asset['browser_download_url'] = asset['browser_download_url'].replace('SIPANTAU.exe', asset['name'])
+        for package_format in ('onedir', 'onefile'):
+            with self.subTest(package_format=package_format), mock.patch.object(updater.requests, 'Session') as session, mock.patch.object(updater, 'BUILD_FORMAT', package_format):
+                client = session.return_value.__enter__.return_value
+                client.get.return_value.json.return_value = data
+                self.assertEqual(updater.check_for_update('1.0.0')[1]['name'], 'SIPANTAU-portable.zip')
+                self.assertIsNone(updater.fetch_update(client, '1.0.0'))
+                asset['digest'] = ''
+                with self.assertRaises(ValueError):
+                    updater.check_for_update('1.0.0')
+                asset['digest'] = 'sha256:' + 'a'*64

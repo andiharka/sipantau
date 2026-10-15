@@ -66,3 +66,8 @@ class ClientConfigTests(unittest.TestCase):
         self.assertIn('https://host:8443/base', summary)
         self.assertIn('Diatur · disembunyikan', summary)
         self.assertEqual(masked_key('1234'), '••••')
+
+    def test_folder_package_does_not_claim_automatic_update_support(self):
+        data = {**valid_config(), 'auto_update': True}
+        summary = dict(configuration_summary(data, 'PC-01', update_supported=False))
+        self.assertIn('Tidak tersedia', summary['Pembaruan otomatis'])

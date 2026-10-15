@@ -75,7 +75,7 @@ def safe_server_url(value):
         return 'Tidak valid'
 
 
-def configuration_summary(data, hostname):
+def configuration_summary(data, hostname, update_supported=True):
     enabled = lambda field, default=False: 'Aktif' if data.get(field, default) else 'Nonaktif'
     return [
         ('Nama komputer', hostname),
@@ -83,7 +83,7 @@ def configuration_summary(data, hostname):
         ('API key', masked_key(data.get('api_key'))),
         ('Password petugas', 'Diatur · disembunyikan' if data.get('master_password') else 'Belum diatur'),
         ('Verifikasi TLS', enabled('verify_ssl', True)),
-        ('Pembaruan otomatis', enabled('auto_update')),
+        ('Pembaruan otomatis', enabled('auto_update') if update_supported else 'Tidak tersedia · gunakan paket lengkap'),
         ('Jalankan saat masuk', enabled('autorun')),
         ('Kunci saat mulai', enabled('auto_lock_on_run')),
         ('Kualitas JPEG', str(data.get('screenshot_jpeg_quality', 80))),

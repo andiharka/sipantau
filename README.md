@@ -49,26 +49,25 @@ Place `config.json` beside the complete Python source checkout (or the compiled 
 
 ---
 
-## Compiling to Standalone Executable (.exe)
+## Building and installing Windows packages
 
-To package the agent into a single executable that requests administrator permissions automatically:
+The recommended package is **SIPANTAU-portable.zip**: extract the entire `SIPANTAU` folder and keep `_internal` beside `SIPANTAU.exe`. It does not self-extract its runtime into a temporary directory. Store the folder where only administrators can modify program files. Configure `server_url`, `api_key`, and a private `master_password` in `config.json` beside the executable before starting it.
 
-1. **Install PyInstaller:**
-   ```cmd
-   pip install pyinstaller
-   ```
+To upgrade a folder installation, stop the old agent, back up its directory, extract the new package into a separate directory, and copy your existing `config.json` and `state.json` into that directory. Keep the new `_internal` directory. The included config is a public template, not your saved configuration; do not overwrite your private settings with it. The build helper never copies the workstation's real config into a release.
 
-2. **Compile with PyInstaller:**
-   Use the following command to generate a windowed/no-console executable requesting UAC elevation on launch:
-   ```cmd
-   pyinstaller --onefile --noconsole --uac-admin --name SIPANTAU agent.py
-   ```
-   - `--onefile`: Bundles the script and packages into one `.exe`.
-   - `--noconsole`: Hides the command line window (necessary for background/kiosk operation).
-   - `--uac-admin`: Configures the manifest to prompt for Administrator permissions when opened on Windows.
+Build on Windows using the actual release version in place of the example tag:
 
-3. **Deploy:**
-   Move the compiled `SIPANTAU.exe` from the `dist` directory and place `config.json` next to it.
+```powershell
+python -m pip install -r requirements.txt -r requirements-build.txt
+python scripts/build_windows.py onedir --tag v1.7.0
+./scripts/scan_release.ps1 -Path dist/onedir/SIPANTAU -ReportPath build-reports/portable-scan.json
+python scripts/build_windows.py archive --tag v1.7.0
+./scripts/scan_release.ps1 -Path release/SIPANTAU-portable.zip -ReportPath build-reports/portable-archive-scan.json
+```
+
+The helper embeds the version and package format, adds Windows product/version metadata, pins the build tool versions through `requirements-build.txt`, and explicitly disables UPX. The original source `version.py` is restored even if building fails. Windows administrator access remains required for the existing hosts and kiosk functions.
+
+An optional legacy `SIPANTAU.exe` single-file artifact is retained for compatible existing installations and their executable-only updater. The workflow publishes it only after its separate Defender scan succeeds. PyInstaller advises against running a one-file executable with administrator privileges because of temporary-library extraction risks; use the complete folder package for new deployments. A different package or a passing scan is not a guarantee that a detection was a false positive.
 
 ---
 
@@ -134,7 +133,7 @@ Running countdowns use monotonic time. Restarting offline reconstructs the deadl
 
 ## Opt-in automatic updates
 
-Set `"auto_update": true` in `config.json` and restart a **Windows 10/11 packaged release**. It is disabled by default and for source runs. Install the first updated executable manually; older agents cannot update themselves. The existing public release `v1.4.0` predates this updater; publish a newer tagged release containing these changes before rollout. The release workflow embeds each stable `vMAJOR.MINOR.PATCH` tag into the executable.
+For a **Windows 10/11 legacy single-file release**, set `"auto_update": true` in `config.json` and restart the agent. The folder package disables executable-only automatic installation regardless of this flag: check for updates in settings and install the complete new folder manually. It is disabled by default and for source runs. Install the first updated executable manually; older agents cannot update themselves. The existing public release `v1.4.0` predates this updater; publish a newer tagged release containing these changes before rollout. The release workflow embeds each stable `vMAJOR.MINOR.PATCH` tag into the executable.
 
 1. Check the public `andiharka/sipantau` GitHub repository after 30 seconds and then every six hours. Prereleases and older/equal versions are ignored.
 2. While the PC is locked with no local pending action or session, download `SIPANTAU.exe` over verified HTTPS. Require the SHA-256 digest and size from the GitHub release asset API, cap downloads at 128 MiB, and reject incomplete/mismatched files. No Pantau key or password is sent to GitHub.
@@ -216,4 +215,24 @@ The draggable timer uses a readable seconds countdown and a remaining-time bar. 
 Config and UI regression tests cover BOM files, startup warnings and exact paths, secret masking, preset/eye/settings callbacks, wrong-then-correct password entry, early heartbeat acknowledgment, stale focus callbacks and failed unlocks. GUI widgets are simulated in local tests: verify the actual Windows appearance, hover/focus behavior, text scaling and keyboard hooks on a spare PC before rollout.
 
 
-The lock screen shows the running version in its bottom-left corner without a product heading. The hidden settings viewer includes **Periksa pembaruan**, which checks the latest public stable GitHub release in a background worker and reports an available version, an up-to-date version, connection/rate-limit failures, missing releases, or unverifiable metadata. It works independently of `auto_update`, uses verified HTTPS and the same release asset checks as the automatic updater, and does not download or install an executable. Closing/unlocking the screen while a check runs safely discards that dialog's result. Installation continues to use the existing opt-in automatic updater and its lock/readiness protections.
+The lock screen shows the running version in its bottom-left corner without a product heading. The hidden settings viewer includes **Periksa pembaruan**, which checks the latest public stable GitHub release in a background worker and reports an available version, an up-to-date version, connection/rate-limit failures, missing releases, or unverifiable metadata. It works independently of `auto_update`, uses verified HTTPS and the same release asset checks as the automatic updater, and does not download or install a package. Closing/unlocking the screen while a check runs safely discards that dialog's result. Installation continues to use the existing opt-in automatic updater and its lock/readiness protections.
+
+
+## Antivirus detection and release verification
+
+These changes improve package transparency and release checks; they do not establish that the reported v1.6.0 Defender detection was a false positive or guarantee acceptance by every antivirus product. The project does not modify antivirus exclusions, disable protection, obfuscate the program, or claim that unsigned binaries are signed.
+
+For each release the workflow:
+
+1. Tests the client and build/release guards, builds the complete folder, and scans all its files with Microsoft Defender.
+2. Creates and scans the final portable ZIP. Defender must be installed and active with real-time protection enabled; security intelligence must update successfully. Missing scanners, scan errors/detections, and files changed/deleted during scanning block publication of the required folder package.
+3. Separately builds and scans the optional legacy executable. If it fails to build or scan, it is omitted while an approved folder package can still be released. Existing executable-only updaters skip folder-only releases; manual checks can discover the folder package.
+4. Records Defender engine/signature versions, scan outcomes, per-file SHA-256 values, installed dependency versions, source commit and workflow URL. `SHA256SUMS.txt` covers the actual release artifacts. These hashes provide consistency checks, not publisher authentication.
+
+`-DisableRemediation` in the custom scan prevents the scanner from modifying that scan's input so hashes can be compared before/after. It does not turn off real-time protection. Any nonzero scan result is rejected, and files that disappear due to real-time quarantine also fail the gate.
+
+Run **Build and Release SIPANTAU → Run workflow** with a stable version string to test the build/scans without creating a GitHub Release. A successful manual run saves only the approved candidate packages as an Actions artifact. Scan reports/logs are saved on failed runs as well. Tag-triggered runs publish only after the required gates pass. If the hosted Windows runner does not provide an active Defender installation, the workflow intentionally stops; use a suitably protected Windows runner to run this gate.
+
+PowerShell regression tests mock Defender to verify clean, detection, quarantine, altered-file, disabled/unavailable-scanner and signature-update failure paths. They are decision tests, not real malware scans. Native Windows packaging, the Defender verdict on the resulting binaries, and the kiosk UI still require a Windows run. Publisher signing remains an additional step requiring a valid signing identity; none is configured or fabricated by this change.
+
+References: [PyInstaller packaging and administrator warning](https://pyinstaller.org/en/stable/operating-mode.html), [Defender scan options and exit codes](https://learn.microsoft.com/en-us/defender-endpoint/command-line-arguments-microsoft-defender-antivirus), [Microsoft developer detection review](https://learn.microsoft.com/en-us/defender-xdr/developer-faq).
