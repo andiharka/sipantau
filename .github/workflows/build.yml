@@ -7,12 +7,16 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version for a scan-only build, for example v1.7.0'
+        description: 'Version for a build, smoke check and scan without publishing, for example v1.7.0'
         required: true
         type: string
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -34,11 +38,22 @@ jobs:
       - name: Install application and pinned build dependencies
         run: python -m pip install -r requirements.txt -r requirements-build.txt
 
-      - name: Test protocol, offline controls, remote commands and release guards
+      - name: Refuse published tags and clear assets from retryable drafts
+        if: github.event_name == 'push'
+        run: python scripts/github_release.py prepare --tag $env:RELEASE_TAG
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test controls, autorun registration and release guards
         run: python -m unittest discover -s tests -v
+        env:
+          SIPANTAU_REQUIRE_WINDOWS_TESTS: '1'
 
       - name: Build recommended folder package
         run: python scripts/build_windows.py onedir --tag $env:RELEASE_TAG
+
+      - name: Smoke check the packaged folder executable
+        run: python scripts/smoke_windows.py --executable dist/onedir/SystemObservation/SystemObservation.exe --report build-reports/portable-smoke.json --tag $env:RELEASE_TAG --format onedir
 
       - name: Scan complete folder package with Microsoft Defender
         run: ./scripts/scan_release.ps1 -Path dist/onedir/SystemObservation -ReportPath build-reports/portable-scan.json
@@ -52,78 +67,82 @@ jobs:
       - name: Keep the portable asset name recognized by older clients
         run: Copy-Item -LiteralPath release/SystemObservation-portable.zip -Destination release/SIPANTAU-portable.zip
 
-      - name: Build optional legacy executable
+      - name: Build optional single-file executable
         id: legacy-build
         continue-on-error: true
         run: python scripts/build_windows.py onefile --tag $env:RELEASE_TAG
 
-      - name: Scan optional legacy executable
-        id: legacy-scan
+      - name: Smoke check optional single-file executable
+        id: legacy-smoke
         if: steps.legacy-build.outcome == 'success'
+        continue-on-error: true
+        run: python scripts/smoke_windows.py --executable dist/onefile/SystemObservation.exe --report build-reports/legacy-smoke.json --tag $env:RELEASE_TAG --format onefile
+
+      - name: Scan optional single-file executable
+        id: legacy-scan
+        if: steps.legacy-smoke.outcome == 'success'
         continue-on-error: true
         run: ./scripts/scan_release.ps1 -Path dist/onefile/SystemObservation.exe -ReportPath build-reports/legacy-scan.json
 
-      - name: Include legacy executable only after a successful scan
+      - name: Include single-file executable only after successful smoke and scan checks
         if: steps.legacy-scan.outcome == 'success'
         run: |
           Copy-Item -LiteralPath dist/onefile/SystemObservation.exe -Destination release/SystemObservation.exe
-          # Older installed clients request this exact release asset name.
           Copy-Item -LiteralPath dist/onefile/SystemObservation.exe -Destination release/SIPANTAU.exe
 
-      - name: Collect scan reports and release provenance
+      - name: Verify approved bytes and generate exact asset list, notes and summary
+        id: release
+        env:
+          LEGACY_STATUS: ${{ steps.legacy-build.outcome != 'success' && 'build-failed' || steps.legacy-smoke.outcome != 'success' && 'smoke-failed' || steps.legacy-scan.outcome != 'success' && 'scan-failed' || 'included' }}
         run: |
           Copy-Item build-reports/*.json release/
-          python scripts/build_windows.py manifest --tag $env:RELEASE_TAG
-          if ('${{ steps.legacy-scan.outcome }}' -ne 'success') {
-            Write-Warning 'The legacy executable was not approved for publication. This release contains only the complete folder package.'
-          }
+          python scripts/release_artifacts.py prepare --tag $env:RELEASE_TAG --legacy $env:LEGACY_STATUS
 
-      - name: Show scan reports even when a gate fails
+      - name: Show concise check reports even when a gate fails
         if: always()
         run: |
           Get-ChildItem build-reports/*.json -ErrorAction SilentlyContinue | ForEach-Object {
             Write-Host $_.Name
-            Get-Content -LiteralPath $_.FullName | Write-Host
+            Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json | Select-Object outcome, ok, version, build_format, scan_exit_code, signature_version, error | Format-List
           }
 
-      - name: Preserve scan reports
+      - name: Preserve check reports
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: release-scan-reports
+          name: release-check-reports
           path: build-reports/
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Save scanned candidate packages for a manual run
+      - name: Recheck the exact publication set
+        run: python scripts/release_artifacts.py verify --tag $env:RELEASE_TAG
+
+      - name: Save verified candidate packages for a manual run
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v6
         with:
           name: scanned-release-candidate
-          path: release/
+          path: ${{ steps.release.outputs.files }}
           if-no-files-found: error
           retention-days: 14
 
-      - name: Create GitHub Release from scanned artifacts
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+      - name: Upload the verified files to a draft release
+        id: draft
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v3
         with:
-          name: ${{ github.ref_name }}
-          draft: false
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          draft: true
           prerelease: false
           fail_on_unmatched_files: true
-          body: |
-            Application: Service Host: System Observation (SIPANTAU project).
+          body_path: build-reports/release-notes.md
+          files: ${{ steps.release.outputs.files }}
 
-            Recommended download: SystemObservation-portable.zip. Extract the complete folder and keep _internal beside SystemObservation.exe. Configure your private config.json before starting.
-
-            config.json is also available as a separate public template for the optional single-file executable. Place it beside SystemObservation.exe and configure server_url, api_key and a private master_password before starting.
-
-            Folder packages use manual installation for updates. When upgrading, retain your existing config.json and state.json; do not overwrite them with the template.
-
-            SIPANTAU.exe and SIPANTAU-portable.zip are identical compatibility downloads for older update checks.
-
-            SystemObservation.exe is included only if the optional legacy single-file build passed its Defender scan. SHA256SUMS.txt, build-manifest.json and scan reports describe the published artifacts. A clean CI scan is a point-in-time result, not a guarantee against future or other-engine detections.
-          files: release/*
+      - name: Verify GitHub asset hashes and publish the draft
+        if: github.event_name == 'push'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+        run: python scripts/github_release.py publish --tag $env:RELEASE_TAG --release-id $env:RELEASE_ID

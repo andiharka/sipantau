@@ -24,6 +24,12 @@ import requests
 import urllib3
 import psutil
 
+# Run before config/log/state loading. CI only creates a hidden Tk window and
+# checks bundled dependencies; it must never hook keys, lock, poll or register tasks.
+if __name__ == '__main__' and len(sys.argv) > 1 and sys.argv[1] == '--smoke-test':
+    from startup_checks import smoke_test
+    sys.exit(smoke_test(sys.argv[2]) if len(sys.argv) == 3 else 2)
+
 # 1. Config Loader
 CONFIG_ERROR = None
 CONFIG_LOADED_AT = None
@@ -64,6 +70,7 @@ LOCAL_ADOPTION = None
 BOOT_ID = uuid.uuid4().hex
 COMMAND_MANAGER = None
 LOCAL_CONTROL_EPOCH = 0
+AUTORUN_STATUS = 'Belum diperiksa'
 HOST_ACTION_LOCK = threading.Lock()
 UPDATE_CHECK_LOCK = threading.Lock()
 
@@ -334,34 +341,34 @@ def get_agent_hostname():
     return socket.gethostname()
 
 def update_autorun(enabled):
+    global AUTORUN_STATUS
     if os.name != 'nt':
-        return
+        AUTORUN_STATUS = 'Tidak tersedia · khusus Windows'
+        return True
     try:
-        import winreg
-        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-        app_name = "SipantauAgent"
-        
-        # Determine executable path
-        if getattr(sys, 'frozen', False):
-            # Running as compiled exe
-            exe_path = sys.executable
-        else:
-            # Running as script
-            exe_path = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
-            
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
-        if enabled:
-            winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, exe_path)
-            logging.info(f"Autorun registry entry added: {exe_path}")
-        else:
-            try:
-                winreg.DeleteValue(key, app_name)
-                logging.info("Autorun registry entry removed.")
-            except FileNotFoundError:
-                pass
-        winreg.CloseKey(key)
-    except Exception as e:
-        logging.error(f"Failed to update autorun registry: {str(e)}")
+        from windows_autorun import configure_autorun
+        task = configure_autorun(enabled, sys.executable, os.path.dirname(config_path),
+                                 script=None if getattr(sys, 'frozen', False) else os.path.abspath(__file__))
+        AUTORUN_STATUS = ('Terdaftar · ' if enabled else 'Nonaktif · ') + task
+        logging.info('Autorun login task %s: %s', 'registered' if enabled else 'removed', task)
+        return True
+    except Exception as error:
+        AUTORUN_STATUS = 'Gagal · ' + str(error)
+        logging.error('Failed to configure autorun login task: %s', error)
+        return False
+
+
+def warn_autorun_failure():
+    messagebox.showwarning(
+        'Startup otomatis belum siap',
+        'Pengaturan jalankan saat masuk belum berhasil diterapkan.\n\n' + AUTORUN_STATUS +
+        '\n\nPeriksa izin administrator dan layanan Task Scheduler, lalu jalankan kembali agen.',
+        parent=lock_window or root)
+
+
+def configure_startup_autorun():
+    if not update_autorun(config.get('autorun', False)):
+        enqueue_gui(warn_autorun_failure)
 
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -569,7 +576,8 @@ def show_configuration_viewer(window):
     scrollbar.config(command=details.yview)
     rows = [("File konfigurasi", config_path), ("Dibaca pada", CONFIG_LOADED_AT or "Tidak diketahui"),
             ("Versi agen", VERSION), ("Format paket", {"onedir": "Folder lengkap", "onefile": "File tunggal", "source": "Python"}.get(BUILD_FORMAT, BUILD_FORMAT)),
-            *configuration_summary(config, get_agent_hostname(), update_supported=BUILD_FORMAT == "onefile")]
+            *configuration_summary(config, get_agent_hostname(), update_supported=BUILD_FORMAT == "onefile"),
+            ("Pendaftaran saat masuk", AUTORUN_STATUS)]
     details.insert("1.0", "\n\n".join(label + "\n" + str(value) for label, value in rows))
     details.config(state="disabled")
 
@@ -1640,15 +1648,15 @@ if __name__ == "__main__":
     expire_local_session()
     threading.Thread(target=restore_cached_site_policy, daemon=True).start()
 
-    # Configure autorun registration (Windows only)
-    update_autorun(config.get("autorun", False))
-
     # Enforce cached local state even when an offline action is awaiting sync.
     if config.get("auto_lock_on_run", False):
         set_local_control(True, "force-lock")
     root.after(0, restore_gui_state)
-
     root.after(50, process_gui_commands)
+
+    # Task Scheduler may be slow/unavailable; never delay the kiosk or network loops.
+    AUTORUN_STATUS = 'Sedang diperiksa'
+    threading.Thread(target=configure_startup_autorun, name='Autorun', daemon=True).start()
 
     # Run the background blacklist process checker
     watcher_thread = threading.Thread(target=blacklist_watcher, daemon=True)

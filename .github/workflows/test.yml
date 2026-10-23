@@ -1,6 +1,9 @@
-name: Test SIPANTAU on Windows
+name: Test and Build System Observation on Windows
 
 on:
+  push:
+    branches:
+      - '**'
   pull_request:
   workflow_dispatch:
 
@@ -10,13 +13,29 @@ permissions:
 jobs:
   test:
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-      - name: Install dependencies
-        run: python -m pip install -r requirements.txt
-      - name: Test agent and Windows installer
+      - name: Install application and pinned build dependencies
+        run: python -m pip install -r requirements.txt -r requirements-build.txt
+      - name: Test agent, Windows installer and autorun registration
         run: python -m unittest discover -s tests -v
+        env:
+          SIPANTAU_REQUIRE_WINDOWS_TESTS: '1'
+      - name: Build the folder package before release
+        run: |
+          $tag = python -c "from version import VERSION; print('v' + VERSION)"
+          "CI_BUILD_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          python scripts/build_windows.py onedir --tag $tag
+      - name: Smoke check the packaged executable
+        run: python scripts/smoke_windows.py --executable dist/onedir/SystemObservation/SystemObservation.exe --report build-reports/ci-smoke.json --tag $env:CI_BUILD_TAG --format onedir
+      - name: Preserve smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-smoke-report
+          path: build-reports/ci-smoke.json
+          if-no-files-found: ignore

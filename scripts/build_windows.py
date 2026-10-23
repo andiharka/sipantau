@@ -27,6 +27,10 @@ For an upgrade, stop the old agent and back up its directory first. Copy your
 existing config.json and state.json into this new folder; do not overwrite them
 with the template. Configure server_url, api_key and a private master_password
 before starting a new installation. Start {EXECUTABLE_NAME} with administrator access.
+For automatic login startup, set autorun=true and launch once as administrator in
+the same administrator account that will sign in. Confirm task registration in
+settings. This starts after sign-in, not before sign-in. Different administrator
+credentials from a standard-user desktop cannot register its interactive startup.
 
 The folder package supports manual update checks. Install its updates as a complete
 folder; executable-only automatic replacement is disabled for this package.
@@ -114,7 +118,7 @@ def archive_folder(root):
     return destination
 
 
-def write_manifest(root, tag):
+def write_manifest(root, tag, packages=None):
     root = Path(root).resolve()
     parse_version(tag)
     release = root/'release'
@@ -133,6 +137,8 @@ def write_manifest(root, tag):
                            if os.environ.get('GITHUB_REPOSITORY') and os.environ.get('GITHUB_RUN_ID') else None,
                 'python': sys.version, 'dependencies': dependencies, 'files': files,
                 'signing': 'No Authenticode signing configured; checksums are not publisher signatures'}
+    if packages is not None:
+        manifest['packages'] = packages
     path = release/'build-manifest.json'
     path.write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
     manifest_hash = hashlib.sha256(path.read_bytes()).hexdigest()

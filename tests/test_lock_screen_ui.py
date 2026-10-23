@@ -226,12 +226,21 @@ class LockScreenUiTests(unittest.TestCase):
         self.assertIn('••••1234', text)
         self.assertNotIn(agent.config['api_key'], text)
         self.assertNotIn(agent.config['master_password'], text)
+        self.assertIn('Pendaftaran saat masuk', text)
+        self.assertIn(agent.AUTORUN_STATUS, text)
         self.assertTrue(agent.is_locked)
         self.assertTrue(dialog.grabbed)
         close = next(widget for widget in descendants(dialog) if widget.props.get('text') == 'Tutup')
         close.invoke()
         self.assertFalse(dialog.alive)
         self.assertTrue(self.window.grabbed)
+
+    def test_settings_show_failed_registration_even_when_autorun_is_configured(self):
+        with mock.patch.dict(agent.config, autorun=True), mock.patch.object(agent, 'AUTORUN_STATUS', 'Gagal · Task Scheduler denied'):
+            agent.show_configuration_viewer(self.window)
+        text = '\n'.join(widget.value for widget in descendants(self.window._settings_dialog))
+        self.assertIn('Jalankan saat masuk\nAktif', text)
+        self.assertIn('Pendaftaran saat masuk\nGagal · Task Scheduler denied', text)
 
     def test_delayed_focus_callback_cannot_revive_a_dismissed_window(self):
         self.window.bindings['<FocusOut>'](None)

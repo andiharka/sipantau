@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 with mock.patch.object(logging, 'basicConfig'):
     import agent
@@ -123,6 +124,42 @@ class GuiLifecycleTests(unittest.TestCase):
         with mock.patch.object(agent, 'CONFIG_ERROR', None), mock.patch.object(agent.messagebox, 'showwarning') as warning:
             self.assertTrue(agent.startup_config_ready(parent))
             warning.assert_not_called()
+
+    def test_windows_autorun_passes_packaged_and_source_paths_and_reports_failures(self):
+        self.addCleanup(setattr, agent, 'AUTORUN_STATUS', agent.AUTORUN_STATUS)
+        with mock.patch.object(agent, 'os', SimpleNamespace(name='nt', path=__import__('os').path)), mock.patch.object(agent, 'sys', SimpleNamespace(executable='C:/Agent/SystemObservation.exe', frozen=True)), mock.patch('windows_autorun.configure_autorun', return_value='SIPANTAUAgent-test') as configure:
+            self.assertTrue(agent.update_autorun(True))
+            configure.assert_called_once_with(True, 'C:/Agent/SystemObservation.exe',
+                                              agent.os.path.dirname(agent.config_path), script=None)
+            self.assertIn('Terdaftar', agent.AUTORUN_STATUS)
+            agent.sys.frozen = False
+            self.assertTrue(agent.update_autorun(False))
+            self.assertEqual(configure.call_args.kwargs['script'], agent.os.path.abspath(agent.__file__))
+            self.assertIn('Nonaktif', agent.AUTORUN_STATUS)
+            configure.side_effect = RuntimeError('Task Scheduler denied')
+            self.assertFalse(agent.update_autorun(True))
+            self.assertIn('Gagal', agent.AUTORUN_STATUS)
+            self.assertIn('Task Scheduler denied', agent.AUTORUN_STATUS)
+
+    def test_autorun_failure_is_queued_for_gui_and_shows_actual_registration_status(self):
+        while not agent.GUI_COMMANDS.empty():
+            agent.GUI_COMMANDS.get_nowait()
+        with mock.patch.object(agent, 'update_autorun', return_value=False), mock.patch.object(agent.messagebox, 'showwarning') as warning:
+            agent.configure_startup_autorun()
+            warning.assert_not_called()
+            with mock.patch.object(agent, 'AUTORUN_STATUS', 'Gagal · access denied'):
+                agent.GUI_COMMANDS.get_nowait()()
+            self.assertIn('Gagal · access denied', warning.call_args.args[1])
+        with mock.patch.object(agent, 'update_autorun', return_value=True), mock.patch.object(agent, 'enqueue_gui') as enqueue:
+            agent.configure_startup_autorun()
+            enqueue.assert_not_called()
+
+    def test_other_platforms_never_register_a_windows_task(self):
+        self.addCleanup(setattr, agent, 'AUTORUN_STATUS', agent.AUTORUN_STATUS)
+        with mock.patch.object(agent, 'os', SimpleNamespace(name='posix')), mock.patch('windows_autorun.configure_autorun') as configure:
+            self.assertTrue(agent.update_autorun(True))
+            configure.assert_not_called()
+            self.assertIn('khusus Windows', agent.AUTORUN_STATUS)
 
     def test_frozen_config_path_uses_executable_directory_and_loads_once(self):
         old_error, old_loaded_at = agent.CONFIG_ERROR, agent.CONFIG_LOADED_AT
