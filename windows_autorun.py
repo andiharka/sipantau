@@ -63,6 +63,7 @@ public static class AgentLoginSession {
 
 SCHEDULER_SCRIPT = r'''
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 try {
     $inputData = [Console]::In.ReadToEnd() | ConvertFrom-Json
@@ -74,28 +75,52 @@ try {
         $null = $folder.RegisterTask($inputData.task_name, $inputData.xml, 6,
             $inputData.user_id, $null, 3, $null)
         $task = $folder.GetTask($inputData.task_name)
-        $definition = $task.Definition
-        $action = $definition.Actions.Item(1)
+        # Verify persisted XML rather than derived COM interfaces. COM may expose
+        # only the base trigger interface and returns null for empty arguments.
+        [xml]$saved = $task.Xml
+        $ns = New-Object Xml.XmlNamespaceManager($saved.NameTable)
+        $ns.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+        function ReadTask($path) {
+            $node = $saved.SelectSingleNode('/t:Task/' + $path, $ns)
+            if ($null -eq $node) { return '' }
+            return [string]$node.InnerText
+        }
         function AccountSid($account) {
             if ($account -like 'S-1-*') { return $account }
             return (New-Object Security.Principal.NTAccount($account)).Translate(
                 [Security.Principal.SecurityIdentifier]).Value
         }
-        $taskSid = AccountSid $definition.Principal.UserId
-        $trigger = $definition.Triggers.Item(1)
-        if (!$task.Enabled -or $definition.Principal.RunLevel -ne 1 -or
-            $definition.Principal.LogonType -ne 3 -or $taskSid -ne $inputData.user_id -or
-            $definition.Actions.Count -ne 1 -or $definition.Triggers.Count -ne 1 -or
-            $trigger.Type -ne 9 -or !$trigger.Enabled -or
-            (AccountSid $trigger.UserId) -ne $inputData.user_id -or
-            $definition.Settings.ExecutionTimeLimit -ne 'PT0S' -or
-            $definition.Settings.DisallowStartIfOnBatteries -or
-            $definition.Settings.StopIfGoingOnBatteries -or
-            $definition.Settings.RunOnlyIfNetworkAvailable -or
-            $action.Path -ne $inputData.executable -or
-            $action.Arguments -ne $inputData.arguments -or
-            $action.WorkingDirectory -ne $inputData.directory) {
-            throw 'Pendaftaran tugas tidak sesuai konfigurasi yang diminta.'
+        function ReadBool($path, $default) {
+            $value = ReadTask $path
+            if ($value -eq '') { return $default }
+            return [Xml.XmlConvert]::ToBoolean($value)
+        }
+        $checks = @(
+            @('Enabled', [bool]$task.Enabled, $true),
+            @('RunLevel', (ReadTask 't:Principals/t:Principal/t:RunLevel'), 'HighestAvailable'),
+            @('LogonType', (ReadTask 't:Principals/t:Principal/t:LogonType'), 'InteractiveToken'),
+            @('Principal.UserId', (AccountSid (ReadTask 't:Principals/t:Principal/t:UserId')), $inputData.user_id),
+            @('Actions.Count', $saved.SelectNodes('/t:Task/t:Actions/*', $ns).Count, 1),
+            @('Triggers.Count', $saved.SelectNodes('/t:Task/t:Triggers/*', $ns).Count, 1),
+            @('LogonTrigger.Count', $saved.SelectNodes('/t:Task/t:Triggers/t:LogonTrigger', $ns).Count, 1),
+            @('Trigger.Enabled', (ReadBool 't:Triggers/t:LogonTrigger/t:Enabled' $true), $true),
+            @('Trigger.UserId', (AccountSid (ReadTask 't:Triggers/t:LogonTrigger/t:UserId')), $inputData.user_id),
+            @('ExecutionTimeLimit', [Xml.XmlConvert]::ToTimeSpan((ReadTask 't:Settings/t:ExecutionTimeLimit')).Ticks, 0),
+            @('DisallowStartIfOnBatteries', (ReadBool 't:Settings/t:DisallowStartIfOnBatteries' $true), $false),
+            @('StopIfGoingOnBatteries', (ReadBool 't:Settings/t:StopIfGoingOnBatteries' $true), $false),
+            @('RunOnlyIfNetworkAvailable', (ReadBool 't:Settings/t:RunOnlyIfNetworkAvailable' $false), $false),
+            @('Command', (ReadTask 't:Actions/t:Exec/t:Command'), [string]$inputData.executable),
+            @('Arguments', (ReadTask 't:Actions/t:Exec/t:Arguments'), [string]$inputData.arguments),
+            @('WorkingDirectory', (ReadTask 't:Actions/t:Exec/t:WorkingDirectory'), [string]$inputData.directory)
+        )
+        $mismatches = @($checks | Where-Object {
+            if ($_[0] -eq 'Arguments') { $_[1] -cne $_[2] }
+            else { $_[1] -ne $_[2] }
+        } | ForEach-Object {
+            '{0}: expected [{1}], actual [{2}]' -f $_[0], $_[2], $_[1]
+        })
+        if ($mismatches.Count) {
+            throw ('Pendaftaran tugas tidak sesuai: ' + ($mismatches -join '; '))
         }
     } else {
         # Enumerate including hidden tasks, avoiding locale-dependent "not found" errors.

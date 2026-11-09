@@ -123,7 +123,9 @@ def write_manifest(root, tag, packages=None):
     parse_version(tag)
     release = root/'release'
     files = []
-    for file in sorted(release.iterdir()):
+    # Path ordering is case-insensitive on Windows; the verifier sorts strings.
+    # Use the same explicit filename ordering on every platform.
+    for file in sorted(release.iterdir(), key=lambda path: path.name):
         if file.is_file() and file.name not in ('SHA256SUMS.txt', 'build-manifest.json'):
             with file.open('rb') as stream:
                 digest = hashlib.sha256()

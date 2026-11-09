@@ -11,6 +11,28 @@ from app_identity import APP_NAME, EXECUTABLE_STEM, EXECUTABLE_NAME, PORTABLE_NA
 
 
 class ReleaseBuildTests(unittest.TestCase):
+    def test_manifest_order_is_independent_of_windows_path_sorting(self):
+        # Reproduce Windows' case-insensitive Path ordering even on macOS/Linux.
+        class WindowsOrderPath(type(Path())):
+            def __lt__(self, other):
+                return str(self).casefold() < str(other).casefold()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / 'release'
+            release.mkdir()
+            names = ['SystemObservation-portable.zip', 'SIPANTAU-portable.zip',
+                     'config.json', 'portable-scan.json']
+            for name in names:
+                (release / name).write_bytes(b'test')
+            entries = [WindowsOrderPath(release / name) for name in names]
+            with mock.patch.object(Path, 'iterdir', return_value=iter(entries)):
+                write_manifest(root, 'v1.7.0')
+            manifest = json.loads((release / 'build-manifest.json').read_text())
+            self.assertEqual([row['name'] for row in manifest['files']], sorted(names))
+            checksums = (release / 'SHA256SUMS.txt').read_text().splitlines()
+            self.assertEqual([line.split('  ')[1] for line in checksums[:-1]], sorted(names))
+
     def test_folder_build_embeds_format_and_preserves_source_and_private_config(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

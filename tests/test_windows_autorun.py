@@ -148,6 +148,11 @@ class NativeAutorunTests(unittest.TestCase):
                 xml = ET.fromstring(result['xml'])
                 self.assertEqual(xml.findtext('t:Actions/t:Exec/t:Arguments', default='', namespaces=NS), arguments)
                 self.assertEqual(xml.findtext('t:Settings/t:ExecutionTimeLimit', namespaces=NS), 'PT0S')
+            # A real mismatch must name the field, rather than returning an opaque
+            # configuration error. The persisted XML still has the previous args.
+            payload['arguments'] = 'unexpected arguments'
+            with self.assertRaisesRegex(autorun.AutorunError, 'Arguments: expected'):
+                autorun._powershell(autorun.SCHEDULER_SCRIPT, payload)
         finally:
             payload['enabled'] = False
             self.assertTrue(autorun._powershell(autorun.SCHEDULER_SCRIPT, payload)['ok'])
