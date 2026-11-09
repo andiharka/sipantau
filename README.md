@@ -77,9 +77,9 @@ Build on Windows using the actual release version in place of the example tag:
 
 ```powershell
 python -m pip install -r requirements.txt -r requirements-build.txt
-python scripts/build_windows.py onedir --tag v1.7.1
+python scripts/build_windows.py onedir --tag v1.7.2
 ./scripts/scan_release.ps1 -Path dist/onedir/SystemObservation -ReportPath build-reports/portable-scan.json
-python scripts/build_windows.py archive --tag v1.7.1
+python scripts/build_windows.py archive --tag v1.7.2
 ./scripts/scan_release.ps1 -Path release/SystemObservation-portable.zip -ReportPath build-reports/portable-archive-scan.json
 ```
 
@@ -153,7 +153,7 @@ Running countdowns use monotonic time. Restarting offline reconstructs the deadl
 
 ## Opt-in automatic updates
 
-For a **Windows 10/11 legacy single-file release**, set `"auto_update": true` in `config.json` and restart the agent. The folder package disables executable-only automatic installation regardless of this flag: check for updates in settings and install the complete new folder manually. It is disabled by default and for source runs. Install an updater-capable executable manually when upgrading an older client that lacks this feature. The published `v1.6.2` release contains the updater; the `v1.7.1` source adds elevated login-task registration and stronger release verification. These source changes reach installed clients only after a new package is built and deployed. The release workflow embeds each stable `vMAJOR.MINOR.PATCH` tag into the executable.
+For a **Windows 10/11 legacy single-file release**, set `"auto_update": true` in `config.json` and restart the agent. The folder package disables executable-only automatic installation regardless of this flag: check for updates in settings and install the complete new folder manually. It is disabled by default and for source runs. Install an updater-capable executable manually when upgrading an older client that lacks this feature. The published `v1.6.2` release contains the updater; the `v1.7.2` source adds elevated login-task registration and stronger release verification. These source changes reach installed clients only after a new package is built and deployed. The release workflow embeds each stable `vMAJOR.MINOR.PATCH` tag into the executable.
 
 1. Check the public `andiharka/sipantau` GitHub repository after 30 seconds and then every six hours. Prereleases and older/equal versions are ignored.
 2. While the PC is locked with no local pending action or session, download `SystemObservation.exe` over verified HTTPS. Require the SHA-256 digest and size from the GitHub release asset API, cap downloads at 128 MiB, and reject incomplete/mismatched files. No Pantau key or password is sent to GitHub.
@@ -253,7 +253,7 @@ For each release the workflow:
 
 `-DisableRemediation` in the custom scan prevents the scanner from modifying that scan's input so hashes can be compared before/after. It does not change real-time protection settings. GitHub's hosted Windows image disables real-time monitoring and adds broad exclusions; this custom-scan option ignores file exclusions and includes archive scanning as documented by Microsoft. Any nonzero scan result is rejected, and files that disappear due to real-time quarantine also fail the gate.
 
-Run **Build and Release System Observation → Run workflow** with a stable version string, such as `v1.7.1`, to test the build, smoke checks and scans without creating or modifying a GitHub Release. A successful manual run saves only the verified publication set as `scanned-release-candidate`. Check reports/logs are saved on failed runs as `release-check-reports`. Tag-triggered runs publish only after the required gates pass. If the hosted Windows runner cannot provide a running Defender service and a working on-demand scan, the workflow stops with the native scan error and diagnostic report; use a runner that supports Defender scanning. The gate does not require endpoint real-time monitoring to be enabled.
+Run **Build and Release System Observation → Run workflow** with a stable version string, such as `v1.7.2`, to test the build, smoke checks and scans without creating or modifying a GitHub Release. A successful manual run saves only the verified publication set as `scanned-release-candidate`. Check reports/logs are saved on failed runs as `release-check-reports`. Tag-triggered runs publish only after the required gates pass. If the hosted Windows runner cannot provide a running Defender service and a working on-demand scan, the workflow stops with the native scan error and diagnostic report; use a runner that supports Defender scanning. The gate does not require endpoint real-time monitoring to be enabled.
 
 Packaged smoke mode (`--smoke-test <report-path>`) loads dependencies, the bundled icon and a hidden Tk window, then exits. It runs before configuration, logging and state loading; it never installs login tasks, activates keyboard hooks, changes hosts rules, polls a server or locks the PC. It verifies bundled startup dependencies and embedded version/package format, **not** the full kiosk UI, UAC prompts, or startup after a real reboot/sign-in. Perform those acceptance checks on a spare Windows workstation before rollout.
 

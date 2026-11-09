@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version for a build, smoke check and scan without publishing, for example v1.7.1'
+        description: 'Version for a build, smoke check and scan without publishing, for example v1.7.2'
         required: true
         type: string
 

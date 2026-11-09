@@ -48,6 +48,20 @@ def fixture(root, legacy='included'):
 
 
 class PublicationTests(unittest.TestCase):
+    def test_notes_and_summary_use_utf8_even_with_windows_default_encoding(self):
+        original_open = Path.open
+
+        def windows_open(path, mode='r', buffering=-1, encoding=None, *args, **kwargs):
+            if 'b' not in mode and encoding in (None, 'locale'):
+                encoding = 'cp1252'
+            return original_open(path, mode, buffering, encoding, *args, **kwargs)
+
+        # Exercise the note/summary assertions with Windows' default encoding on
+        # every platform. Removing explicit UTF-8 reads reproduces the CI failure.
+        with mock.patch.object(Path, 'open', windows_open):
+            self.test_exact_assets_and_notes_for_complete_and_folder_only_releases()
+            self.test_workflow_outputs_use_explicit_paths_and_describe_omissions()
+
     def test_exact_assets_and_notes_for_complete_and_folder_only_releases(self):
         for legacy in artifacts.LEGACY_STATES:
             with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as directory:
@@ -56,7 +70,7 @@ class PublicationTests(unittest.TestCase):
                 records = artifacts.prepare_release(root, TAG, legacy)
                 self.assertEqual(records, artifacts.verify_release(root, TAG))
                 self.assertEqual({row['name'] for row in records}, {path.name for path in release.iterdir()})
-                notes = (root / 'build-reports' / 'release-notes.md').read_text()
+                notes = (root / 'build-reports' / 'release-notes.md').read_text(encoding='utf-8')
                 self.assertIn('autorun=true', notes)
                 self.assertIn('do not verify', notes)
                 if legacy == 'included':
@@ -103,7 +117,7 @@ class PublicationTests(unittest.TestCase):
             with zipfile.ZipFile(release / PORTABLE_NAME, 'a') as archive:
                 archive.writestr(EXECUTABLE_STEM + '/unscanned.dll', b'unscanned')
             (release / 'SIPANTAU-portable.zip').write_bytes((release / PORTABLE_NAME).read_bytes())
-            report = json.loads((release / 'portable-archive-scan.json').read_text())
+            report = json.loads((release / 'portable-archive-scan.json').read_text(encoding='utf-8'))
             row = artifacts.file_record(release / PORTABLE_NAME)
             report['files'] = [{'path': PORTABLE_NAME, 'size': row['size'], 'sha256': row['sha256']}]
             (release / 'portable-archive-scan.json').write_text(json.dumps(report))
@@ -119,7 +133,7 @@ class PublicationTests(unittest.TestCase):
             with self.subTest(name=name, field=field), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 release = fixture(root)
-                data = json.loads((release / name).read_text())
+                data = json.loads((release / name).read_text(encoding='utf-8'))
                 data[field] = value
                 (release / name).write_text(json.dumps(data))
                 with self.assertRaises(ValueError):
@@ -132,7 +146,7 @@ class PublicationTests(unittest.TestCase):
                 release = fixture(root)
                 artifacts.prepare_release(root, TAG, 'included')
                 if change == 'manifest':
-                    data = json.loads((release / 'build-manifest.json').read_text())
+                    data = json.loads((release / 'build-manifest.json').read_text(encoding='utf-8'))
                     data['files'].pop()
                     (release / 'build-manifest.json').write_text(json.dumps(data))
                 elif change == 'checksums':
@@ -147,10 +161,10 @@ class PublicationTests(unittest.TestCase):
             output, summary = root / 'output', root / 'summary'
             with mock.patch.dict('os.environ', GITHUB_OUTPUT=str(output), GITHUB_STEP_SUMMARY=str(summary)):
                 records = artifacts.prepare_release(root, TAG, 'scan-failed')
-            lines = output.read_text().splitlines()
+            lines = output.read_text(encoding='utf-8').splitlines()
             self.assertEqual(lines[1:-1], ['release/' + row['name'] for row in records])
-            self.assertNotIn('*', output.read_text())
-            self.assertIn('OMITTED (scan-failed)', summary.read_text())
+            self.assertNotIn('*', output.read_text(encoding='utf-8'))
+            self.assertIn('OMITTED (scan-failed)', summary.read_text(encoding='utf-8'))
 
 
 class GitHubPublicationTests(unittest.TestCase):
